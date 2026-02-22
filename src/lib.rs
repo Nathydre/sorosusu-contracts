@@ -36,6 +36,7 @@ pub struct Circle {
     pub cycle_number: u32,
     pub current_payout_index: u32,
     pub total_volume_distributed: i128,
+
 }
 
 #[derive(Clone)]
@@ -52,6 +53,13 @@ pub struct GroupRolloverEvent {
     pub new_cycle_number: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct LateJoinerCaughtUpEvent {
+    pub member_address: Address,
+    pub amount_paid: i128,
+}
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -59,14 +67,7 @@ pub enum Error {
     CycleNotComplete = 1001,
     InsufficientAllowance = 1002,
     AlreadyJoined = 1003,
-    CircleNotFound = 1004,
-    Unauthorized = 1005,
-    MaxMembersReached = 1006,
-    CircleNotFinalized = 1007,
-    InvalidFeeConfig = 1008,
-    InvalidUpgradeHash = 1009,
-    PayoutAlreadyReceived = 1010,
-    NotMember = 1011,
+
 }
 
 #[contract]
@@ -186,7 +187,13 @@ impl SoroSusu {
     // CIRCLE MANAGEMENT & GOVERNANCE
     // ============================================================
 
-    pub fn create_circle(env: Env, admin: Address, contribution: i128, is_random_queue: bool) -> u32 {
+    pub fn create_circle(
+        env: Env,
+        admin: Address,
+        contribution: i128,
+        is_random_queue: bool,
+        token: Option<Address>,
+    ) -> u32 {
         admin.require_auth();
         let id = next_circle_id(&env);
         let circle = Circle {
@@ -199,6 +206,7 @@ impl SoroSusu {
             cycle_number: 1,
             current_payout_index: 0,
             total_volume_distributed: 0,
+
         };
         write_circle(&env, id, &circle);
         id
@@ -219,7 +227,7 @@ impl SoroSusu {
             panic_with_error!(&env, Error::MaxMembersReached);
         }
 
-        circle.members.push_back(invoker);
+main
         circle.has_received_payout.push_back(false);
         write_circle(&env, circle_id, &circle);
     }
@@ -410,7 +418,7 @@ mod test {
     fn join_circle_enforces_max_members() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false);
+        let circle_id = client.create_circle(&admin, &10_i128, &false, &None);
 
         for _ in 0..MAX_MEMBERS {
             let member = Address::generate(&env);
@@ -428,7 +436,7 @@ mod test {
     fn test_random_queue_finalization() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &true);
+        let circle_id = client.create_circle(&admin, &10_i128, &true, &None);
 
         let members: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
         for member in &members {
@@ -448,7 +456,7 @@ mod test {
     fn test_sequential_queue_finalization() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false);
+        let circle_id = client.create_circle(&admin, &10_i128, &false, &None);
 
         let members: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
         for member in &members {
@@ -468,7 +476,7 @@ mod test {
     fn test_process_payout_and_cycle_completion() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &100_i128, &false);
+        let circle_id = client.create_circle(&admin, &100_i128, &false, &None);
 
         let members: std::vec::Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
         for member in &members {
@@ -494,7 +502,7 @@ mod test {
     fn test_group_rollover() {
         let (env, client) = setup();
         let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &50_i128, &false);
+        let circle_id = client.create_circle(&admin, &50_i128, &false, &None);
 
         let members: std::vec::Vec<Address> = (0..2).map(|_| Address::generate(&env)).collect();
         for member in &members {
