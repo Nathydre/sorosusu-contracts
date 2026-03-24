@@ -1,7 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
 };
 
 // --- ERROR CODES ---
@@ -24,6 +23,10 @@ pub enum Error {
     InsufficientInsurance = 12,
     InsuranceAlreadyUsed = 13,
     RateLimitExceeded = 14,
+    DisputeAlreadyExists = 15,
+    DisputeNotFound = 16,
+    DisputeAlreadyResolved = 17,
+    InvalidFeeConfig = 18,
 }
 
 // --- CONSTANTS ---
@@ -38,6 +41,7 @@ pub enum DataKey {
     Admin,
     Circle(u64),
     Member(Address),
+    CircleMember(u64, u32),
     CircleCount,
     Deposit(u64, Address),
     GroupReserve,
@@ -45,6 +49,19 @@ pub enum DataKey {
     LastCreatedTimestamp(Address),
     SafetyDeposit(Address, u64),
     LendingPool,
+    Dispute(u64, Address),
+    ProtocolFeeBps,
+    ProtocolTreasury,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Dispute {
+    pub circle_id: u64,
+    pub user: Address,
+    pub amount: i128,
+    pub reason_hash: u64,
+    pub is_open: bool,
 }
 
 #[contracttype]
@@ -89,6 +106,9 @@ pub struct CircleInfo {
     pub nft_contract: Address,
     pub is_round_finalized: bool,
     pub current_pot_recipient: Option<Address>,
+    pub arbitrator: Address,
+    pub proposed_arbitrator: Option<Address>,
+    pub arbitrator_votes_bitmap: u64,
 }
 
 // --- CONTRACT CLIENTS ---
@@ -110,6 +130,7 @@ pub trait LendingPoolTrait {
 pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address);
     fn set_lending_pool(env: Env, admin: Address, pool: Address);
+    fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address);
     
     fn create_circle(
         env: Env,
@@ -120,6 +141,7 @@ pub trait SoroSusuTrait {
         cycle_duration: u64,
         insurance_fee_bps: u32,
         nft_contract: Address,
+        arbitrator: Address,
     ) -> u64;
 
     fn join_circle(env: Env, user: Address, circle_id: u64, tier_multiplier: u32, referrer: Option<Address>);
@@ -133,6 +155,12 @@ pub trait SoroSusuTrait {
     
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
+
+    fn raise_dispute(env: Env, user: Address, circle_id: u64, amount: i128, reason_hash: u64);
+    fn resolve_dispute(env: Env, caller: Address, circle_id: u64, user: Address, release_to_user: bool);
+
+    fn propose_arbitrator(env: Env, user: Address, circle_id: u64, new_arbitrator: Address);
+    fn vote_arbitrator(env: Env, user: Address, circle_id: u64);
 }
 
 // --- IMPLEMENTATION ---
@@ -158,6 +186,19 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::LendingPool, &pool);
     }
 
+    fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        if fee_basis_points > 10000 {
+            panic!("InvalidFeeConfig");
+        }
+        env.storage().instance().set(&DataKey::ProtocolFeeBps, &fee_basis_points);
+        env.storage().instance().set(&DataKey::ProtocolTreasury, &treasury);
+    }
+
     fn create_circle(
         env: Env,
         creator: Address,
@@ -167,6 +208,7 @@ impl SoroSusuTrait for SoroSusu {
         cycle_duration: u64,
         insurance_fee_bps: u32,
         nft_contract: Address,
+        arbitrator: Address,
     ) -> u64 {
         creator.require_auth();
 
@@ -202,6 +244,9 @@ impl SoroSusuTrait for SoroSusu {
             nft_contract,
             is_round_finalized: false,
             current_pot_recipient: None,
+            arbitrator,
+            proposed_arbitrator: None,
+            arbitrator_votes_bitmap: 0,
         };
 
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
@@ -235,6 +280,7 @@ impl SoroSusuTrait for SoroSusu {
         };
 
         env.storage().instance().set(&member_key, &new_member);
+        env.storage().instance().set(&DataKey::CircleMember(circle_id, circle.member_count), &user);
         circle.member_count += 1;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
 
@@ -333,10 +379,17 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Not all contributed");
         }
 
-        // recipient is circle.current_recipient_index
-        // We'll need a way to get member by index or store member addresses in circle.
-        // For simplicity in this clean version, let's assume members are stored in a predictable way or we add member_addresses to CircleInfo.
-        // Actually, let's use the bitmap and iterate to find the address if needed, or better, store it in storage under (circle_id, index)
+        let recipient_addr: Address = env.storage().instance()
+            .get(&DataKey::CircleMember(circle_id, circle.current_recipient_index))
+            .expect("Member not found");
+
+        let mut updated_circle = circle;
+        updated_circle.is_round_finalized = true;
+        updated_circle.current_pot_recipient = Some(recipient_addr);
+        
+        let current_time = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &current_time);
+        env.storage().instance().set(&DataKey::Circle(circle_id), &updated_circle);
     }
 
     fn claim_pot(env: Env, user: Address, circle_id: u64) {
@@ -362,13 +415,30 @@ impl SoroSusuTrait for SoroSusu {
 
         let pot_amount = circle.contribution_amount * (circle.member_count as i128);
         let token_client = token::Client::new(&env, &circle.token);
-        token_client.transfer(&env.current_contract_address(), &user, &pot_amount);
+        
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        if fee_bps > 0 {
+            let treasury: Address = env.storage().instance().get(&DataKey::ProtocolTreasury).expect("Treasury not set");
+            let fee = (pot_amount * fee_bps as i128) / 10000;
+            let net_payout = pot_amount - fee;
+            token_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            token_client.transfer(&env.current_contract_address(), &user, &net_payout);
+        } else {
+            token_client.transfer(&env.current_contract_address(), &user, &pot_amount);
+        }
 
         // Reset for next round
         circle.is_round_finalized = false;
         circle.contribution_bitmap = 0;
         circle.is_insurance_used = false;
-        circle.current_recipient_index = (circle.current_recipient_index + 1) % circle.member_count;
+        
+        let new_index = (circle.current_recipient_index + 1) % circle.member_count;
+        if new_index == 0 {
+            let total_volume = pot_amount * (circle.member_count as i128);
+            env.events().publish((symbol_short!("CYCLE_COMP"), circle_id), total_volume);
+            env.events().publish((symbol_short!("GROUP_ROLL"), circle_id), 0u32);
+        }
+        circle.current_recipient_index = new_index;
         circle.current_pot_recipient = None; // Should be set in finalize_round
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
@@ -445,5 +515,251 @@ impl SoroSusuTrait for SoroSusu {
         let mut balance: i128 = env.storage().instance().get(&safety_key).unwrap_or(0);
         balance += amount;
         env.storage().instance().set(&safety_key, &balance);
+    }
+
+    fn raise_dispute(env: Env, user: Address, circle_id: u64, amount: i128, reason_hash: u64) {
+        user.require_auth();
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        let dispute_key = DataKey::Dispute(circle_id, user.clone());
+        if env.storage().instance().has(&dispute_key) {
+            let existing: Dispute = env.storage().instance().get(&dispute_key).unwrap();
+            if existing.is_open {
+                panic!("Dispute already exists");
+            }
+        }
+        
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&user, &env.current_contract_address(), &amount);
+        
+        let new_dispute = Dispute {
+            circle_id,
+            user: user.clone(),
+            amount,
+            reason_hash,
+            is_open: true,
+        };
+        env.storage().instance().set(&dispute_key, &new_dispute);
+        
+        env.events().publish(
+            (symbol_short!("DISPUTE"), symbol_short!("RAISED"), circle_id),
+            (user, amount, reason_hash)
+        );
+    }
+
+    fn resolve_dispute(env: Env, caller: Address, circle_id: u64, user: Address, release_to_user: bool) {
+        caller.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        if caller != circle.arbitrator {
+            panic!("Unauthorized");
+        }
+        
+        let dispute_key = DataKey::Dispute(circle_id, user.clone());
+        let mut dispute: Dispute = env.storage().instance().get(&dispute_key).expect("Dispute not found");
+        
+        if !dispute.is_open {
+            panic!("Dispute already resolved");
+        }
+        
+        dispute.is_open = false;
+        env.storage().instance().set(&dispute_key, &dispute);
+        
+        let token_client = token::Client::new(&env, &circle.token);
+        if release_to_user {
+            token_client.transfer(&env.current_contract_address(), &user, &dispute.amount);
+        } else {
+            // Funds stay in the contract, credit to circle's insurance
+            circle.insurance_balance += dispute.amount;
+            env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        }
+        
+        env.events().publish(
+            (symbol_short!("DISPUTE"), symbol_short!("RESOLVED"), circle_id),
+            (user, release_to_user)
+        );
+    }
+
+    fn propose_arbitrator(env: Env, user: Address, circle_id: u64, new_arbitrator: Address) {
+        user.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        circle.proposed_arbitrator = Some(new_arbitrator);
+        circle.arbitrator_votes_bitmap = 1 << member.index;
+
+        if circle.arbitrator_votes_bitmap.count_ones() > (circle.member_count / 2) {
+            circle.arbitrator = circle.proposed_arbitrator.clone().unwrap();
+            circle.proposed_arbitrator = None;
+            circle.arbitrator_votes_bitmap = 0;
+        }
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn vote_arbitrator(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).expect("Member not found");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member not active");
+        }
+
+        if circle.proposed_arbitrator.is_none() {
+            panic!("No active proposal");
+        }
+
+        circle.arbitrator_votes_bitmap |= 1 << member.index;
+
+        if circle.arbitrator_votes_bitmap.count_ones() > (circle.member_count / 2) {
+            circle.arbitrator = circle.proposed_arbitrator.clone().unwrap();
+            circle.proposed_arbitrator = None;
+            circle.arbitrator_votes_bitmap = 0;
+        }
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+
+    #[contract]
+    pub struct MockNft;
+    #[contractimpl]
+    impl MockNft {
+        pub fn mint(_env: Env, _to: Address, _id: u128) {}
+        pub fn burn(_env: Env, _from: Address, _id: u128) {}
+    }
+
+    #[contract]
+    pub struct MockToken;
+    #[contractimpl]
+    impl MockToken {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    }
+
+    #[test]
+    fn test_arbitration_flow() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Raise dispute
+        client.raise_dispute(&user, &circle_id, &500, &12345);
+        
+        // Resolve dispute - refund to user
+        client.resolve_dispute(&arbitrator, &circle_id, &user, &true);
+        
+        // Raise second dispute
+        client.raise_dispute(&user, &circle_id, &500, &12345);
+        
+        // Resolve dispute - send to insurance pool
+        client.resolve_dispute(&arbitrator, &circle_id, &user, &false);
+    }
+
+    #[test]
+    fn test_arbitrator_voting() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator1 = Address::generate(&env);
+        let arbitrator2 = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+
+        client.init(&admin);
+        let circle_id = client.create_circle(&creator, &1000, &10, &token_contract, &86400, &100, &nft_contract, &arbitrator1);
+        
+        client.join_circle(&user1, &circle_id, &1, &None);
+        client.join_circle(&user2, &circle_id, &1, &None);
+        
+        client.propose_arbitrator(&user1, &circle_id, &arbitrator2);
+        client.vote_arbitrator(&user2, &circle_id);
+        
+        // Dispute should now be resolvable by arbitrator2
+        client.raise_dispute(&user1, &circle_id, &500, &123);
+        client.resolve_dispute(&arbitrator2, &circle_id, &user1, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_resolve_dispute_unauthorized() {
+        let env = Env::default();
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+
+        client.init(&Address::generate(&env));
+        let circle_id = client.create_circle(&Address::generate(&env), &1000, &10, &token_contract, &86400, &100, &nft_contract, &Address::generate(&env));
+        
+        let user = Address::generate(&env);
+        client.join_circle(&user, &circle_id, &1, &None);
+        client.raise_dispute(&user, &circle_id, &500, &12345);
+        
+        // Malicious actor tries to resolve dispute
+        client.resolve_dispute(&Address::generate(&env), &circle_id, &user, &true);
+    }
+
+    #[test]
+    fn test_protocol_fee_config() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        client.set_protocol_fee(&admin, &50, &treasury); // 0.5% fee
     }
 }
