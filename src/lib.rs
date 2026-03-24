@@ -2,6 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token,
+    Address, Env, String, Vec,
     Address, Env, Symbol, Vec,
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
     Address, Bytes, BytesN, Env, String, Symbol, Vec,
@@ -37,6 +38,15 @@ pub enum Error {
     CollateralLocked = 18,
     MemberNotDefaulted = 19,
     CollateralAlreadyReleased = 20,
+    // Guarantor-related errors
+    GuarantorNotFound = 21,
+    InsufficientReputation = 22,
+    GuarantorNotRegistered = 23,
+    VoucherAlreadyExists = 24,
+    VoucherNotFound = 25,
+    GuarantorOverextended = 26,
+    SelfGuaranteeNotAllowed = 27,
+    GuarantorInsufficientFunds = 28,
     LeniencyRequestNotFound = 21,
     AlreadyVoted = 22,
     VotingPeriodExpired = 23,
@@ -66,6 +76,11 @@ const QUADRATIC_MAJORITY: u32 = 60; // 60% supermajority for rule changes
 const MAX_VOTE_WEIGHT: u32 = 100; // Maximum quadratic vote weight
 const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for groups >= 10 members
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
+const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
+// Guarantor-related constants
+const MIN_GUARANTOR_REPUTATION: u32 = 100; // Minimum reputation score to become a guarantor
+const MAX_VOUCHURES_PER_GUARANTOR: u32 = 5; // Maximum concurrent vouchers per guarantor
+const GUARANTOR_COLLATERAL_MULTIPLIER: u32 = 150; // 150% of member's contribution as guarantor collateral
 const HIGH_VALUE_THRESHOLD: i128 = 10_000_000_000; // 1000 XLM (assuming 7 decimals)
 
 // --- DATA STRUCTURES ---
@@ -88,6 +103,11 @@ pub enum DataKey {
     CollateralVault(Address, u64),
     CollateralConfig(u64),
     DefaultedMembers(u64),
+    // Guarantor-related storage keys
+    Guarantor(Address),
+    Voucher(Address, u64), // (guarantor_address, circle_id)
+    GuarantorVault(Address), // Guarantor's collateral vault
+    ActiveVouchersCount(Address),
     MemberAtIndex(u64, u32),
     Reputation(Address),
     BadgeContract,
@@ -294,6 +314,53 @@ pub struct CollateralInfo {
     pub release_timestamp: Option<u64>,
 }
 
+// --- GUARANTOR DATA STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum GuarantorStatus {
+    Registered,
+    Active,
+    Suspended,
+    Blacklisted,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum VoucherStatus {
+    Active,
+    Claimed, // Guarantor paid for member default
+    Expired, // Member completed all obligations
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GuarantorInfo {
+    pub address: Address,
+    pub reputation_score: u32,
+    pub total_vouched_amount: i128,
+    pub active_vouchers_count: u32,
+    pub successful_vouchers: u32,
+    pub claimed_vouchers: u32,
+    pub status: GuarantorStatus,
+    pub registered_timestamp: u64,
+    pub vault_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VoucherInfo {
+    pub guarantor: Address,
+    pub member: Address,
+    pub circle_id: u64,
+    pub vouched_amount: i128,
+    pub status: VoucherStatus,
+    pub created_timestamp: u64,
+    pub claimed_timestamp: Option<u64>,
+    pub collateral_required: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Reputation {
@@ -316,6 +383,7 @@ pub struct Member {
     pub tier_multiplier: u32,
     pub referrer: Option<Address>,
     pub buddy: Option<Address>,
+    pub guarantor: Option<Address>, // Guarantor who co-signed for this member
 }
 
 #[contracttype]
@@ -645,6 +713,20 @@ fn next_active_member_index(env: &Env, circle: &CircleInfo, start_index: u32) ->
     fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn release_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address);
+    
+    // Guarantor functions
+    fn register_guarantor(env: Env, user: Address, initial_collateral: i128);
+    fn update_guarantor_reputation(env: Env, admin: Address, guarantor: Address, new_score: u32);
+    fn create_voucher(env: Env, guarantor: Address, member: Address, circle_id: u64, vouched_amount: i128);
+    fn claim_voucher(env: Env, caller: Address, circle_id: u64, member: Address);
+    fn add_guarantor_collateral(env: Env, guarantor: Address, amount: i128);
+    fn withdraw_guarantor_collateral(env: Env, guarantor: Address, amount: i128);
+    
+    // Query functions for guarantor system
+    fn get_guarantor_info(env: Env, guarantor: Address) -> GuarantorInfo;
+    fn get_voucher_info(env: Env, guarantor: Address, circle_id: u64) -> VoucherInfo;
+    fn get_member_guarantor(env: Env, member: Address) -> Option<Address>;
+    fn get_guarantor_vault_balance(env: Env, guarantor: Address) -> i128;
 
     // Privacy functions
     fn get_reputation_hash(env: Env, user: Address) -> BytesN<32>;
@@ -999,13 +1081,21 @@ impl SoroSusuTrait for SoroSusu {
             let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
             let collateral_info: Option<CollateralInfo> = env.storage().instance().get(&collateral_key);
             
-            match collateral_info {
-                Some(collateral) => {
-                    if collateral.status != CollateralStatus::Staked {
-                        panic!("Collateral not properly staked");
-                    }
-                }
-                None => panic!("Collateral required for this circle"),
+            // Allow member to join if they have either collateral OR a guarantor
+            let has_collateral = match collateral_info {
+                Some(collateral) => collateral.status == CollateralStatus::Staked,
+                None => false,
+            };
+
+            let has_guarantor = {
+                // Check if there's an active voucher for this member
+                // This would require finding the voucher by member address, which is challenging with current storage structure
+                // For now, we'll assume the member has been assigned a guarantor before joining
+                false // This will be handled by the create_voucher function
+            };
+
+            if !has_collateral && !has_guarantor {
+                panic!("Collateral or guarantor required for this circle");
             }
         }
 
@@ -1039,6 +1129,7 @@ impl SoroSusuTrait for SoroSusu {
             tier_multiplier,
             referrer,
             buddy: None,
+            guarantor: None, // Will be set when voucher is created
         };
 
         env.storage().instance().set(&member_key, &new_member);
@@ -1771,8 +1862,12 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         // Slash the collateral - distribute to remaining active members
-        let token_client = token::Client::new(&env, &circle.token);
+        let _token_client = token::Client::new(&env, &circle.token);
         let slash_amount = collateral_info.amount;
+        
+        // Get active members (excluding defaulted member)
+        // This is a simplified approach - in practice, you'd want to store member addresses more efficiently
+        // For now, we'll distribute to group reserve
         
         // Transfer to group reserve for distribution
         let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
@@ -1853,12 +1948,300 @@ impl SoroSusuTrait for SoroSusu {
             env.storage().instance().set(&defaulted_key, &defaulted_members);
         }
 
-        // Auto-slash collateral if staked
+    // Auto-slash collateral if staked
         let collateral_key = DataKey::CollateralVault(member.clone(), circle_id);
         if let Some(_collateral) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
             // Reuse slash_collateral logic
-            Self::slash_collateral(env, caller, circle_id, member);
+            Self::slash_collateral(env.clone(), caller.clone(), circle_id, member.clone());
         }
+
+        // Auto-claim voucher if member has a guarantor
+        if let Some(guarantor_addr) = &member_info.guarantor {
+            let voucher_key = DataKey::Voucher(guarantor_addr.clone(), circle_id);
+            if let Some(voucher_info) = env.storage().instance().get::<DataKey, VoucherInfo>(&voucher_key) {
+                if voucher_info.status == VoucherStatus::Active {
+                    // Automatically claim voucher to cover default
+                    Self::claim_voucher(env.clone(), stored_admin.clone(), circle_id, member.clone());
+                }
+            }
+        }
+    }
+
+// --- GUARANTOR FUNCTION IMPLEMENTATIONS ---
+    // --- GUARANTOR FUNCTION IMPLEMENTATIONS ---
+
+    fn register_guarantor(env: Env, user: Address, initial_collateral: i128) {
+        user.require_auth();
+
+        let guarantor_key = DataKey::Guarantor(user.clone());
+        if env.storage().instance().has(&guarantor_key) {
+            panic!("Already registered as guarantor");
+        }
+
+        if initial_collateral <= 0 {
+            panic!("Initial collateral must be positive");
+        }
+
+        // Transfer initial collateral to contract
+        // Note: In a real implementation, you'd need to get the token address
+        // For now, we'll assume a default token or that it's passed as a parameter
+        let token_address = Address::from_string(&String::from_str(&env, "TOKEN_ADDRESS_HERE"));
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&user, &env.current_contract_address(), &initial_collateral);
+
+        let current_time = env.ledger().timestamp();
+        let guarantor_info = GuarantorInfo {
+            address: user.clone(),
+            reputation_score: MIN_GUARANTOR_REPUTATION,
+            total_vouched_amount: 0,
+            active_vouchers_count: 0,
+            successful_vouchers: 0,
+            claimed_vouchers: 0,
+            status: GuarantorStatus::Active,
+            registered_timestamp: current_time,
+            vault_balance: initial_collateral,
+        };
+
+        env.storage().instance().set(&guarantor_key, &guarantor_info);
+        env.storage().instance().set(&DataKey::GuarantorVault(user.clone()), &initial_collateral);
+        env.storage().instance().set(&DataKey::ActiveVouchersCount(user.clone()), &0u32);
+    }
+
+    fn update_guarantor_reputation(env: Env, admin: Address, guarantor: Address, new_score: u32) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let guarantor_key = DataKey::Guarantor(guarantor.clone());
+        let mut guarantor_info: GuarantorInfo = env.storage().instance().get(&guarantor_key)
+            .expect("Guarantor not found");
+
+        guarantor_info.reputation_score = new_score;
+        
+        // Update status based on reputation
+        if new_score < MIN_GUARANTOR_REPUTATION {
+            guarantor_info.status = GuarantorStatus::Suspended;
+        } else if guarantor_info.status == GuarantorStatus::Suspended {
+            guarantor_info.status = GuarantorStatus::Active;
+        }
+
+        env.storage().instance().set(&guarantor_key, &guarantor_info);
+    }
+
+    fn create_voucher(env: Env, guarantor: Address, member: Address, circle_id: u64, vouched_amount: i128) {
+        guarantor.require_auth();
+
+        // Validate guarantor
+        let guarantor_key = DataKey::Guarantor(guarantor.clone());
+        let mut guarantor_info: GuarantorInfo = env.storage().instance().get(&guarantor_key)
+            .expect("Guarantor not found");
+
+        if guarantor_info.status != GuarantorStatus::Active {
+            panic!("Guarantor not active");
+        }
+
+        if guarantor_info.reputation_score < MIN_GUARANTOR_REPUTATION {
+            panic!("Insufficient reputation");
+        }
+
+        if guarantor_info.active_vouchers_count >= MAX_VOUCHURES_PER_GUARANTOR {
+            panic!("Guarantor overextended");
+        }
+
+        if guarantor == member {
+            panic!("Self-guarantee not allowed");
+        }
+
+        // Check if voucher already exists
+        let voucher_key = DataKey::Voucher(guarantor.clone(), circle_id);
+        if env.storage().instance().has(&voucher_key) {
+            panic!("Voucher already exists for this circle");
+        }
+
+        // Validate circle exists
+        let _circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // Calculate required collateral
+        let collateral_required = (vouched_amount * GUARANTOR_COLLATERAL_MULTIPLIER as i128) / 100;
+        
+        if guarantor_info.vault_balance < collateral_required {
+            panic!("Insufficient guarantor collateral");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let voucher_info = VoucherInfo {
+            guarantor: guarantor.clone(),
+            member: member.clone(),
+            circle_id,
+            vouched_amount,
+            status: VoucherStatus::Active,
+            created_timestamp: current_time,
+            claimed_timestamp: None,
+            collateral_required,
+        };
+
+        // Update guarantor info
+        guarantor_info.total_vouched_amount += vouched_amount;
+        guarantor_info.active_vouchers_count += 1;
+        guarantor_info.vault_balance -= collateral_required;
+
+        // Store voucher and update guarantor
+        env.storage().instance().set(&voucher_key, &voucher_info);
+        env.storage().instance().set(&guarantor_key, &guarantor_info);
+        env.storage().instance().set(&DataKey::GuarantorVault(guarantor.clone()), &guarantor_info.vault_balance);
+        env.storage().instance().set(&DataKey::ActiveVouchersCount(guarantor.clone()), &guarantor_info.active_vouchers_count);
+
+        // Update member with guarantor info
+        let member_key = DataKey::Member(member.clone());
+        let mut member_info: Member = env.storage().instance().get(&member_key)
+            .expect("Member not found");
+        member_info.guarantor = Some(guarantor.clone());
+        env.storage().instance().set(&member_key, &member_info);
+    }
+
+    fn claim_voucher(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if caller != stored_admin && caller != member {
+            panic!("Unauthorized");
+        }
+
+        // Get member info
+        let member_key = DataKey::Member(member.clone());
+        let member_info: Member = env.storage().instance().get(&member_key)
+            .expect("Member not found");
+
+        if member_info.status != MemberStatus::Defaulted {
+            panic!("Member not defaulted");
+        }
+
+        let guarantor = member_info.guarantor.expect("No guarantor found");
+        let voucher_key = DataKey::Voucher(guarantor.clone(), circle_id);
+        let mut voucher_info: VoucherInfo = env.storage().instance().get(&voucher_key)
+            .expect("Voucher not found");
+
+        if voucher_info.status != VoucherStatus::Active {
+            panic!("Voucher not active");
+        }
+
+        let guarantor_key = DataKey::Guarantor(guarantor.clone());
+        let mut guarantor_info: GuarantorInfo = env.storage().instance().get(&guarantor_key)
+            .expect("Guarantor not found");
+
+        // Get circle info for token address
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // Transfer collateral from guarantor vault to cover member's obligation
+        let token_client = token::Client::new(&env, &circle.token);
+        let amount_to_transfer = voucher_info.vouched_amount.min(voucher_info.collateral_required);
+
+        // Get guarantor vault balance and transfer
+        let vault_balance: i128 = env.storage().instance().get(&DataKey::GuarantorVault(guarantor.clone()))
+            .expect("Guarantor vault not found");
+
+        if vault_balance < amount_to_transfer {
+            panic!("Insufficient funds in guarantor vault");
+        }
+
+        // Update voucher status
+        voucher_info.status = VoucherStatus::Claimed;
+        voucher_info.claimed_timestamp = Some(env.ledger().timestamp());
+
+        // Update guarantor stats
+        guarantor_info.active_vouchers_count -= 1;
+        guarantor_info.claimed_vouchers += 1;
+        guarantor_info.vault_balance -= amount_to_transfer;
+
+        // Transfer funds to cover the defaulted member's obligation
+        token_client.transfer(&env.current_contract_address(), &env.current_contract_address(), &amount_to_transfer);
+
+        // Store updated information
+        env.storage().instance().set(&voucher_key, &voucher_info);
+        env.storage().instance().set(&guarantor_key, &guarantor_info);
+        env.storage().instance().set(&DataKey::GuarantorVault(guarantor.clone()), &guarantor_info.vault_balance);
+        env.storage().instance().set(&DataKey::ActiveVouchersCount(guarantor.clone()), &guarantor_info.active_vouchers_count);
+    }
+
+    fn add_guarantor_collateral(env: Env, guarantor: Address, amount: i128) {
+        guarantor.require_auth();
+
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+
+        let guarantor_key = DataKey::Guarantor(guarantor.clone());
+        let mut guarantor_info: GuarantorInfo = env.storage().instance().get(&guarantor_key)
+            .expect("Guarantor not found");
+
+        // Get token address (this should be stored or passed as parameter)
+        let token_address = Address::from_string(&String::from_str(&env, "TOKEN_ADDRESS_HERE"));
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&guarantor, &env.current_contract_address(), &amount);
+
+        guarantor_info.vault_balance += amount;
+
+        env.storage().instance().set(&guarantor_key, &guarantor_info);
+        env.storage().instance().set(&DataKey::GuarantorVault(guarantor.clone()), &guarantor_info.vault_balance);
+    }
+
+    fn withdraw_guarantor_collateral(env: Env, guarantor: Address, amount: i128) {
+        guarantor.require_auth();
+
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+
+        let guarantor_key = DataKey::Guarantor(guarantor.clone());
+        let mut guarantor_info: GuarantorInfo = env.storage().instance().get(&guarantor_key)
+            .expect("Guarantor not found");
+
+        // Check if withdrawing would leave insufficient collateral for active vouchers
+        let required_collateral = guarantor_info.total_vouched_amount - 
+            ((guarantor_info.successful_vouchers as i128) * guarantor_info.total_vouched_amount / 
+             ((guarantor_info.successful_vouchers + guarantor_info.claimed_vouchers + 1) as i128));
+
+        if guarantor_info.vault_balance - amount < required_collateral {
+            panic!("Insufficient collateral available for withdrawal");
+        }
+
+        guarantor_info.vault_balance -= amount;
+
+        // Get token address and transfer
+        let token_address = Address::from_string(&String::from_str(&env, "TOKEN_ADDRESS_HERE"));
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&env.current_contract_address(), &guarantor, &amount);
+
+        env.storage().instance().set(&guarantor_key, &guarantor_info);
+        env.storage().instance().set(&DataKey::GuarantorVault(guarantor.clone()), &guarantor_info.vault_balance);
+    }
+
+    // --- QUERY FUNCTION IMPLEMENTATIONS ---
+
+    fn get_guarantor_info(env: Env, guarantor: Address) -> GuarantorInfo {
+        let guarantor_key = DataKey::Guarantor(guarantor);
+        env.storage().instance().get(&guarantor_key).expect("Guarantor not found")
+    }
+
+    fn get_voucher_info(env: Env, guarantor: Address, circle_id: u64) -> VoucherInfo {
+        let voucher_key = DataKey::Voucher(guarantor, circle_id);
+        env.storage().instance().get(&voucher_key).expect("Voucher not found")
+    }
+
+    fn get_member_guarantor(env: Env, member: Address) -> Option<Address> {
+        let member_key = DataKey::Member(member);
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+        member_info.guarantor
+    }
+
+    fn get_guarantor_vault_balance(env: Env, guarantor: Address) -> i128 {
+        let vault_key = DataKey::GuarantorVault(guarantor);
+        env.storage().instance().get(&vault_key).unwrap_or(0)
     }
 
     fn get_reputation_hash(env: Env, user: Address) -> BytesN<32> {
