@@ -2,6 +2,8 @@
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, contracterror,
     symbol_short, token, Address, Env, String, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Env, String, Symbol, Vec,
 };
 
 // --- ERROR CODES ---
@@ -45,6 +47,20 @@ const DISSOLUTION_REFUND_PERIOD: u64 = 2592000; // 30 days for refund claims aft
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
 const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
 const MAX_QUERY_LIMIT: u32 = 100;
+const ROLLOVER_VOTING_PERIOD: u64 = 172800; // 48 hours for rollover voting
+const ROLLOVER_QUORUM: u32 = 60; // 60% quorum for rollover voting
+const ROLLOVER_MAJORITY: u32 = 66; // 66% supermajority for rollover approval
+const DEFAULT_ROLLOVER_BONUS_BPS: u32 = 5000; // 50% of platform fee refunded as bonus
+
+// Yield Delegation Constants
+const YIELD_VOTING_PERIOD: u64 = 86400; // 24 hours for yield delegation voting
+const YIELD_QUORUM: u32 = 75; // 75% quorum for yield delegation (higher stakes)
+const YIELD_MAJORITY: u32 = 80; // 80% supermajority for yield delegation approval
+const MIN_DELEGATION_AMOUNT: i128 = 100_000_000; // Minimum 10 tokens to delegate
+const MAX_DELEGATION_PERCENTAGE: u32 = 8000; // Maximum 80% of pot can be delegated
+const YIELD_DISTRIBUTION_RECIPIENT_BPS: u32 = 5000; // 50% to current round winner
+const YIELD_DISTRIBUTION_TREASURY_BPS: u32 = 5000; // 50% to group treasury
+const YIELD_COMPOUNDING_FREQUENCY: u64 = 604800; // Weekly compounding (7 days)
 
 // --- DATA STRUCTURES ---
 
@@ -66,6 +82,11 @@ pub enum DataKey {
     ProtocolFeeBps,
     ProtocolTreasury,
     CollateralVault(Address, u64),
+    UserStats(Address),
+    ReputationData(Address),
+    SocialCapital(Address, u64),
+    ProtocolFeeBps,
+    ProtocolTreasury,
     AuditCount,
     AuditEntry(u64),
     AuditAll,
@@ -75,6 +96,20 @@ pub enum DataKey {
     LeniencyStats(u64),
     Proposal(u64),
     DefaultedMembers(u64),
+    RolloverBonus(u64),
+    RolloverVote(u64, Address),
+    CollateralVault(Address, u64),
+    DefaultedMembers(u64),
+    LeniencyStats(u64),
+    LeniencyRequest(u64),
+    Proposal(u64),
+    VotingPower(Address, u64),
+    DissolutionProposal(u64),
+    RefundClaim(u64),
+    YieldDelegation(u64),
+    YieldVote(u64, Address),
+    YieldPoolRegistry,
+    GroupTreasury(u64),
 }
 
 #[contracttype]
@@ -83,6 +118,27 @@ pub struct UserStats {
     pub total_volume_saved: i128,
     pub on_time_contributions: u32,
     pub late_contributions: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReputationData {
+    pub user_address: Address,
+    pub susu_score: u32,        // 0-10000 bps (0-100%)
+    pub reliability_score: u32,  // 0-10000 bps (0-100%)
+    pub total_contributions: u32,
+    pub on_time_rate: u32,      // 0-10000 bps (0-100%)
+    pub volume_saved: i128,
+    pub social_capital: u32,    // 0-10000 bps (0-100%)
+    pub last_updated: u64,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CreditAdvance {
+    pub principal: i128,
+    pub fee: i128,
 }
 
 #[contracttype]
@@ -221,6 +277,126 @@ pub enum RefundStatus {
     Pending,
     Processed,
     Failed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RolloverVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RolloverStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Rejected,
+    Applied,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldVoteChoice {
+    For,
+    Against,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDelegationStatus {
+    NotInitiated,
+    Voting,
+    Approved,
+    Rejected,
+    Active,
+    Completed,
+    Withdrawn,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldPoolType {
+    StellarLiquidityPool,
+    RegulatedMoneyMarket,
+    StableYieldVault,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDelegation {
+    pub circle_id: u64,
+    pub delegation_amount: i128,
+    pub pool_address: Address,
+    pub pool_type: YieldPoolType,
+    pub delegation_percentage: u32, // Percentage of pot to delegate
+    pub created_timestamp: u64,
+    pub status: YieldDelegationStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+    pub total_yield_earned: i128,
+    pub yield_distributed: i128,
+    pub last_compound_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: YieldVoteChoice,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldPoolInfo {
+    pub pool_address: Address,
+    pub pool_type: YieldPoolType,
+    pub is_active: bool,
+    pub total_delegated: i128,
+    pub apy_bps: u32, // Annual Percentage Yield in basis points
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistribution {
+    pub circle_id: u64,
+    pub recipient_share: i128,
+    pub treasury_share: i128,
+    pub total_yield: i128,
+    pub distribution_time: u64,
+    pub round_number: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RolloverBonus {
+    pub circle_id: u64,
+    pub bonus_amount: i128,
+    pub fee_percentage: u32, // Percentage of platform fee to refund
+    pub created_timestamp: u64,
+    pub status: RolloverStatus,
+    pub voting_deadline: u64,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub total_votes_cast: u32,
+    pub applied_cycle: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RolloverVote {
+    pub voter: Address,
+    pub circle_id: u64,
+    pub vote_choice: RolloverVoteChoice,
+    pub timestamp: u64,
 }
 
 #[contracttype]
@@ -366,6 +542,14 @@ pub struct CircleInfo {
     pub requires_collateral: bool,
     pub collateral_bps: u32,
     pub member_addresses: Vec<Address>,
+    pub member_addresses: Vec<Address>,
+    pub requires_collateral: bool,
+    pub leniency_enabled: bool,
+    pub grace_period_end: Option<u64>,
+    pub quadratic_voting_enabled: bool,
+    pub proposal_count: u64,
+    pub dissolution_status: DissolutionStatus,
+    pub dissolution_deadline: Option<u64>,
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
     pub recovery_old_address: Option<Address>,
@@ -473,6 +657,22 @@ pub trait SoroSusuTrait {
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
 
+    // Rollover Bonus Incentive Logic
+    fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32);
+    fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice);
+    fn apply_rollover_bonus(env: Env, circle_id: u64);
+
+    // Idle Pot Yield Delegation to Stellar Pools
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType);
+    fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice);
+    fn approve_yield_delegation(env: Env, circle_id: u64);
+    fn execute_yield_delegation(env: Env, circle_id: u64);
+    fn compound_yield(env: Env, circle_id: u64);
+    fn withdraw_yield_delegation(env: Env, circle_id: u64);
+    fn distribute_yield_earnings(env: Env, circle_id: u64);
+
+    // Inter-contract reputation query interface
+    fn get_reputation(env: Env, user: Address) -> ReputationData;
 }
 
 // --- IMPLEMENTATION ---
@@ -508,6 +708,35 @@ fn write_audit(env: &Env, actor: &Address, action: AuditAction, resource_id: u64
         (symbol_short!("AUDIT"), actor.clone(), resource_id),
         (audit_count, entry.timestamp),
     );
+}
+
+fn append_audit_index(env: &Env, index_key: DataKey, audit_id: u64) {
+    let mut index: Vec<u64> = env.storage().instance().get(&index_key).unwrap_or(Vec::new(env));
+    index.push_back(audit_id);
+    env.storage().instance().set(&index_key, &index);
+}
+
+fn calculate_rollover_bonus(env: &Env, circle_id: u64, fee_percentage_bps: u32) -> i128 {
+    // Get the protocol fee settings
+    let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+    if fee_bps == 0 {
+        return 0; // No protocol fee, no bonus
+    }
+
+    // Calculate the total pot amount for this circle
+    let circle_key = DataKey::Circle(circle_id);
+    let circle: CircleInfo = env.storage().instance().get(&circle_key)
+        .expect("Circle not found");
+    
+    let total_pot = circle.contribution_amount * (circle.member_count as i128);
+    
+    // Calculate the platform fee that would be charged
+    let platform_fee = (total_pot * fee_bps as i128) / 10000;
+    
+    // Calculate the rollover bonus (percentage of platform fee to refund)
+    let bonus_amount = (platform_fee * fee_percentage_bps as i128) / 10000;
+    
+    bonus_amount
 }
 
 fn get_member_address_by_index(circle: &CircleInfo, index: u32) -> Address {
@@ -811,6 +1040,14 @@ impl SoroSusuTrait for SoroSusu {
             requires_collateral,
             collateral_bps,
             member_addresses: Vec::new(&env),
+            member_addresses: Vec::new(&env),
+            requires_collateral,
+            leniency_enabled: true,
+            grace_period_end: None,
+            quadratic_voting_enabled: max_members >= MIN_GROUP_SIZE_FOR_QUADRATIC,
+            proposal_count: 0,
+            dissolution_status: DissolutionStatus::NotInitiated,
+            dissolution_deadline: None,
             proposed_late_fee_bps: 0,
             proposal_votes_bitmap: 0,
             recovery_old_address: None,
@@ -921,6 +1158,7 @@ impl SoroSusuTrait for SoroSusu {
             late_contributions: 0,
         });
 
+        // Check if contribution is late
         if current_time > circle.deadline_timestamp {
             let base_penalty = (base_amount * circle.late_fee_bps as i128) / 10000;
             // Apply referral discount
@@ -936,7 +1174,17 @@ impl SoroSusuTrait for SoroSusu {
             let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
             reserve += penalty_amount;
             env.storage().instance().set(&DataKey::GroupReserve, &reserve);
-            
+        }
+
+        // Update user statistics
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let mut user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+
+        if penalty_amount > 0 {
             user_stats.late_contributions += 1;
         } else {
             user_stats.on_time_contributions += 1;
@@ -1013,6 +1261,33 @@ impl SoroSusuTrait for SoroSusu {
             panic!("Not all contributed");
         }
 
+        // Set round as finalized and determine next recipient
+        circle.is_round_finalized = true;
+        
+        // Set next recipient (round-robin)
+        let next_recipient_index = (circle.current_recipient_index + 1) % circle.member_count;
+        let next_recipient = get_member_address_by_index(&circle, next_recipient_index);
+        
+        circle.current_recipient_index = next_recipient_index;
+        circle.current_pot_recipient = Some(next_recipient);
+        
+        // Schedule payout time (end of month from now)
+        let current_time = env.ledger().timestamp();
+        let payout_time = current_time + (30 * 24 * 60 * 60); // 30 days from now
+        env.storage().instance().set(&DataKey::ScheduledPayoutTime(circle_id), &payout_time);
+        
+        // Reset for next round
+        circle.contribution_bitmap = 0;
+        circle.deadline_timestamp = current_time + circle.cycle_duration;
+        
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        
+        // Publish round finalization event
+        env.events().publish(
+            (Symbol::new(&env, "ROUND_FINALIZED"), circle_id),
+            (next_recipient, payout_time, next_recipient_index),
+        );
+
 
     }
 
@@ -1046,17 +1321,36 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         let pot_amount = circle.contribution_amount * (circle.member_count as i128);
+        
+        // Check for rollover bonus and add to first pot of new cycles
+        let mut total_payout = pot_amount;
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        if let Some(rollover_bonus) = env.storage().instance().get::<DataKey, RolloverBonus>(&rollover_key) {
+            if rollover_bonus.status == RolloverStatus::Applied {
+                if let Some(applied_cycle) = rollover_bonus.applied_cycle {
+                    if applied_cycle == circle.current_recipient_index {
+                        total_payout += rollover_bonus.bonus_amount;
+                        
+                        env.events().publish(
+                            (Symbol::new(&env, "ROLLOVER_BONUS_APPLIED"), circle_id, user.clone()),
+                            (rollover_bonus.bonus_amount, applied_cycle),
+                        );
+                    }
+                }
+            }
+        }
+        
         let token_client = token::Client::new(&env, &circle.token);
         
         let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
         if fee_bps > 0 {
             let treasury: Address = env.storage().instance().get(&DataKey::ProtocolTreasury).expect("Treasury not set");
-            let fee = (pot_amount * fee_bps as i128) / 10000;
-            let net_payout = pot_amount - fee;
+            let fee = (total_payout * fee_bps as i128) / 10000;
+            let net_payout = total_payout - fee;
             token_client.transfer(&env.current_contract_address(), &treasury, &fee);
             token_client.transfer(&env.current_contract_address(), &user, &net_payout);
         } else {
-            token_client.transfer(&env.current_contract_address(), &user, &pot_amount);
+            token_client.transfer(&env.current_contract_address(), &user, &total_payout);
         }
 
         // Auto-release collateral if member has completed all contributions
@@ -1404,6 +1698,698 @@ impl SoroSusuTrait for SoroSusu {
         
         let contract_id = env.register_contract(None, SoroSusu);
         let client = SoroSusuClient::new(&env, &contract_id);
+    fn get_reputation(env: Env, user: Address) -> ReputationData {
+        let current_time = env.ledger().timestamp();
+        
+        // Get user statistics
+        let user_stats_key = DataKey::UserStats(user.clone());
+        let user_stats: UserStats = env.storage().instance().get(&user_stats_key).unwrap_or(UserStats {
+            total_volume_saved: 0,
+            on_time_contributions: 0,
+            late_contributions: 0,
+        });
+
+        // Get member information to check if user is active
+        let member_key = DataKey::Member(user.clone());
+        let is_active = if let Some(member) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            member.status == MemberStatus::Active
+        } else {
+            false
+        };
+
+        // Calculate total contributions
+        let total_contributions = user_stats.on_time_contributions + user_stats.late_contributions;
+        
+        // Calculate on-time rate (in basis points)
+        let on_time_rate = if total_contributions > 0 {
+            (user_stats.on_time_contributions * 10000) / total_contributions
+        } else {
+            0
+        };
+
+        // Calculate reliability score based on on-time rate and volume
+        let mut reliability_score = on_time_rate;
+        
+        // Boost reliability based on volume saved (higher volume = higher reliability)
+        if user_stats.total_volume_saved > 0 {
+            let volume_bonus = ((user_stats.total_volume_saved / 1_000_000_0) * 100).min(2000); // Max 20% bonus
+            reliability_score = (reliability_score + volume_bonus).min(10000);
+        }
+
+        // Calculate social capital (sum of trust scores across all circles)
+        let mut social_capital = 0u32;
+        let mut circle_count = 0u32;
+        
+        // Get all circles the user is part of by checking member data
+        // For now, we'll use a simplified approach - in a full implementation,
+        // you might want to maintain an index of user's circles
+        for circle_id in 1..=1000 { // Reasonable limit for iteration
+            let circle_key = DataKey::Circle(circle_id);
+            if let Some(_circle) = env.storage().instance().get::<DataKey, CircleInfo>(&circle_key) {
+                let social_capital_key = DataKey::SocialCapital(user.clone(), circle_id);
+                if let Some(soc_cap) = env.storage().instance().get::<DataKey, SocialCapital>(&social_capital_key) {
+                    social_capital += soc_cap.trust_score;
+                    circle_count += 1;
+                }
+            }
+        }
+
+        // Average social capital across circles
+        let avg_social_capital = if circle_count > 0 {
+            (social_capital / circle_count) * 100 // Convert to basis points
+        } else {
+            0
+        };
+
+        // Calculate final Susu Score (weighted combination)
+        // Weight: 50% reliability, 30% social capital, 20% activity
+        let activity_score = if total_contributions > 0 {
+            ((total_contributions as u32).min(50) * 200) // Max 10% from activity
+        } else {
+            0
+        };
+
+        let susu_score = (
+            (reliability_score * 50) / 100 +  // 50% weight
+            (avg_social_capital * 30) / 100 +  // 30% weight  
+            (activity_score * 20) / 100         // 20% weight
+        ).min(10000);
+
+        ReputationData {
+            user_address: user.clone(),
+            susu_score,
+            reliability_score,
+            total_contributions,
+            on_time_rate,
+            volume_saved: user_stats.total_volume_saved,
+            social_capital: avg_social_capital,
+            last_updated: current_time,
+            is_active,
+        }
+    }
+
+    fn propose_rollover_bonus(env: Env, user: Address, circle_id: u64, fee_percentage_bps: u32) {
+        user.require_auth();
+
+        if fee_percentage_bps > 10000 {
+            panic!("Fee percentage cannot exceed 100%");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if there's already an active rollover proposal
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        if let Some(existing_rollover) = env.storage().instance().get::<DataKey, RolloverBonus>(&rollover_key) {
+            if existing_rollover.status == RolloverStatus::Voting {
+                panic!("Rollover bonus proposal already active");
+            }
+        }
+
+        // Only allow rollover proposals after the first round is complete
+        if !circle.is_round_finalized || circle.current_recipient_index == 0 {
+            panic!("Rollover can only be proposed after first complete cycle");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let bonus_amount = calculate_rollover_bonus(&env, circle_id, fee_percentage_bps);
+
+        let rollover_bonus = RolloverBonus {
+            circle_id,
+            bonus_amount,
+            fee_percentage: fee_percentage_bps,
+            created_timestamp: current_time,
+            status: RolloverStatus::Voting,
+            voting_deadline: current_time + ROLLOVER_VOTING_PERIOD,
+            for_votes: 0,
+            against_votes: 0,
+            total_votes_cast: 0,
+            applied_cycle: None,
+        };
+
+        env.storage().instance().set(&rollover_key, &rollover_bonus);
+        
+        // The proposer automatically votes for
+        let vote_key = DataKey::RolloverVote(circle_id, user.clone());
+        let vote = RolloverVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: RolloverVoteChoice::For,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        let mut updated_rollover = rollover_bonus;
+        updated_rollover.for_votes = 1;
+        updated_rollover.total_votes_cast = 1;
+        env.storage().instance().set(&rollover_key, &updated_rollover);
+
+        write_audit(&env, &user, AuditAction::DisputeSubmission, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ROLLOVER_PROPOSED"), circle_id, user.clone()),
+            (bonus_amount, fee_percentage_bps, updated_rollover.voting_deadline),
+        );
+    }
+
+    fn vote_rollover_bonus(env: Env, user: Address, circle_id: u64, vote_choice: RolloverVoteChoice) {
+        user.require_auth();
+
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        let mut rollover_bonus: RolloverBonus = env.storage().instance().get(&rollover_key)
+            .expect("No active rollover proposal");
+
+        if rollover_bonus.status != RolloverStatus::Voting {
+            panic!("Rollover proposal is not in voting period");
+        }
+
+        if env.ledger().timestamp() > rollover_bonus.voting_deadline {
+            rollover_bonus.status = RolloverStatus::Rejected;
+            env.storage().instance().set(&rollover_key, &rollover_bonus);
+            panic!("Voting period has expired");
+        }
+
+        // Check if user is an active member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::RolloverVote(circle_id, user.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Record the vote
+        let vote = RolloverVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: vote_choice.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        match vote_choice {
+            RolloverVoteChoice::For => rollover_bonus.for_votes += 1,
+            RolloverVoteChoice::Against => rollover_bonus.against_votes += 1,
+        }
+        rollover_bonus.total_votes_cast += 1;
+
+        // Check if voting criteria are met
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let active_members = count_active_members(&env, &circle);
+        
+        let quorum_met = (rollover_bonus.total_votes_cast * 100) >= (active_members * ROLLOVER_QUORUM);
+        
+        if quorum_met && rollover_bonus.total_votes_cast > 0 {
+            let approval_percentage = (rollover_bonus.for_votes * 100) / rollover_bonus.total_votes_cast;
+            if approval_percentage >= ROLLOVER_MAJORITY {
+                rollover_bonus.status = RolloverStatus::Approved;
+            }
+        }
+
+        env.storage().instance().set(&rollover_key, &rollover_bonus);
+        write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ROLLOVER_VOTE"), circle_id, user.clone()),
+            (vote_choice, rollover_bonus.for_votes, rollover_bonus.against_votes),
+        );
+    }
+
+    fn apply_rollover_bonus(env: Env, circle_id: u64) {
+        let rollover_key = DataKey::RolloverBonus(circle_id);
+        let mut rollover_bonus: RolloverBonus = env.storage().instance().get(&rollover_key)
+            .expect("No rollover bonus proposal found");
+
+        if rollover_bonus.status != RolloverStatus::Approved {
+            panic!("Rollover bonus is not approved");
+        }
+
+        let circle_key = DataKey::Circle(circle_id);
+        let mut circle: CircleInfo = env.storage().instance().get(&circle_key)
+            .expect("Circle not found");
+
+        // Apply the bonus to the group reserve (will be used in next cycle's first pot)
+        let mut reserve: i128 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        reserve += rollover_bonus.bonus_amount;
+        env.storage().instance().set(&DataKey::GroupReserve, &reserve);
+
+        // Mark as applied and track the cycle
+        rollover_bonus.status = RolloverStatus::Applied;
+        rollover_bonus.applied_cycle = Some(circle.current_recipient_index + 1);
+        env.storage().instance().set(&rollover_key, &rollover_bonus);
+
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ROLLOVER_APPLIED"), circle_id),
+            (rollover_bonus.bonus_amount, rollover_bonus.applied_cycle.unwrap()),
+        );
+    }
+
+    fn propose_yield_delegation(env: Env, user: Address, circle_id: u64, delegation_percentage: u32, pool_address: Address, pool_type: YieldPoolType) {
+        user.require_auth();
+
+        if delegation_percentage > MAX_DELEGATION_PERCENTAGE {
+            panic!("Delegation percentage exceeds maximum");
+        }
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if there's already an active yield delegation proposal
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        if let Some(existing_delegation) = env.storage().instance().get::<DataKey, YieldDelegation>(&delegation_key) {
+            if existing_delegation.status == YieldDelegationStatus::Voting || 
+               existing_delegation.status == YieldDelegationStatus::Active {
+                panic!("Yield delegation already active");
+            }
+        }
+
+        // Only allow yield delegation after round is finalized but before payout
+        if !circle.is_round_finalized {
+            panic!("Round must be finalized before yield delegation");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let pot_amount = circle.contribution_amount * (circle.member_count as i128);
+        let delegation_amount = (pot_amount * delegation_percentage as i128) / 10000;
+
+        if delegation_amount < MIN_DELEGATION_AMOUNT {
+            panic!("Delegation amount below minimum");
+        }
+
+        let yield_delegation = YieldDelegation {
+            circle_id,
+            delegation_amount,
+            pool_address: pool_address.clone(),
+            pool_type: pool_type.clone(),
+            delegation_percentage,
+            created_timestamp: current_time,
+            status: YieldDelegationStatus::Voting,
+            voting_deadline: current_time + YIELD_VOTING_PERIOD,
+            for_votes: 0,
+            against_votes: 0,
+            total_votes_cast: 0,
+            start_time: None,
+            end_time: None,
+            total_yield_earned: 0,
+            yield_distributed: 0,
+            last_compound_time: current_time,
+        };
+
+        env.storage().instance().set(&delegation_key, &yield_delegation);
+        
+        // The proposer automatically votes for
+        let vote_key = DataKey::YieldVote(circle_id, user.clone());
+        let vote = YieldVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: YieldVoteChoice::For,
+            timestamp: current_time,
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        let mut updated_delegation = yield_delegation;
+        updated_delegation.for_votes = 1;
+        updated_delegation.total_votes_cast = 1;
+        env.storage().instance().set(&delegation_key, &updated_delegation);
+
+        write_audit(&env, &user, AuditAction::DisputeSubmission, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_PROPOSED"), circle_id, user.clone()),
+            (delegation_amount, delegation_percentage, pool_address, updated_delegation.voting_deadline),
+        );
+    }
+
+    fn vote_yield_delegation(env: Env, user: Address, circle_id: u64, vote_choice: YieldVoteChoice) {
+        user.require_auth();
+
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No active yield delegation proposal");
+
+        if delegation.status != YieldDelegationStatus::Voting {
+            panic!("Yield delegation is not in voting period");
+        }
+
+        if env.ledger().timestamp() > delegation.voting_deadline {
+            delegation.status = YieldDelegationStatus::Rejected;
+            env.storage().instance().set(&delegation_key, &delegation);
+            panic!("Voting period has expired");
+        }
+
+        // Check if user is an active member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .expect("User is not a member");
+
+        if member.status != MemberStatus::Active {
+            panic!("Member is not active");
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::YieldVote(circle_id, user.clone());
+        if env.storage().instance().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Record the vote
+        let vote = YieldVote {
+            voter: user.clone(),
+            circle_id,
+            vote_choice: vote_choice.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&vote_key, &vote);
+
+        // Update vote counts
+        match vote_choice {
+            YieldVoteChoice::For => delegation.for_votes += 1,
+            YieldVoteChoice::Against => delegation.against_votes += 1,
+        }
+        delegation.total_votes_cast += 1;
+
+        // Check if voting criteria are met
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let active_members = count_active_members(&env, &circle);
+        
+        let quorum_met = (delegation.total_votes_cast * 100) >= (active_members * YIELD_QUORUM);
+        
+        if quorum_met && delegation.total_votes_cast > 0 {
+            let approval_percentage = (delegation.for_votes * 100) / delegation.total_votes_cast;
+            if approval_percentage >= YIELD_MAJORITY {
+                delegation.status = YieldDelegationStatus::Approved;
+            }
+        }
+
+        env.storage().instance().set(&delegation_key, &delegation);
+        write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_VOTE"), circle_id, user.clone()),
+            (vote_choice, delegation.for_votes, delegation.against_votes),
+        );
+    }
+
+    fn approve_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation proposal found");
+
+        if delegation.status != YieldDelegationStatus::Approved {
+            panic!("Yield delegation is not approved");
+        }
+
+        // Register the yield pool if not already registered
+        let pool_registry_key = DataKey::YieldPoolRegistry;
+        let mut pool_registry: Vec<Address> = env.storage().instance().get(&pool_registry_key).unwrap_or(Vec::new(&env));
+        
+        if !pool_registry.contains(&delegation.pool_address) {
+            pool_registry.push_back(delegation.pool_address.clone());
+            env.storage().instance().set(&pool_registry_key, &pool_registry);
+        }
+
+        // Update pool info
+        let pool_info = YieldPoolInfo {
+            pool_address: delegation.pool_address.clone(),
+            pool_type: delegation.pool_type.clone(),
+            is_active: true,
+            total_delegated: delegation.delegation_amount,
+            apy_bps: 500, // Default 5% APY (would be fetched from pool)
+            last_updated: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&DataKey::YieldDelegation(circle_id), &pool_info);
+
+        // Execute the delegation
+        execute_yield_delegation_internal(&env, circle_id, &mut delegation);
+
+        env.storage().instance().set(&delegation_key, &delegation);
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_APPROVED"), circle_id),
+            (delegation.delegation_amount, delegation.pool_address),
+        );
+    }
+
+    fn execute_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Approved && delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not approved");
+        }
+
+        execute_yield_delegation_internal(&env, circle_id, &mut delegation);
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_EXECUTED"), circle_id),
+            (delegation.delegation_amount, delegation.pool_address),
+        );
+    }
+
+    fn compound_yield(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not active");
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time < delegation.last_compound_time + YIELD_COMPOUNDING_FREQUENCY {
+            panic!("Too early to compound");
+        }
+
+        // Calculate yield (simplified - would query actual yield from pool)
+        let time_elapsed = current_time - delegation.last_compound_time;
+        let yield_earned = calculate_yield_from_pool(&env, &delegation, time_elapsed);
+
+        delegation.total_yield_earned += yield_earned;
+        delegation.last_compound_time = current_time;
+
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_COMPOUNDED"), circle_id),
+            (yield_earned, delegation.total_yield_earned),
+        );
+    }
+
+    fn withdraw_yield_delegation(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.status != YieldDelegationStatus::Active {
+            panic!("Yield delegation is not active");
+        }
+
+        // Final compound before withdrawal
+        let current_time = env.ledger().timestamp();
+        let time_elapsed = current_time - delegation.last_compound_time;
+        let final_yield = calculate_yield_from_pool(&env, &delegation, time_elapsed);
+        delegation.total_yield_earned += final_yield;
+
+        // Withdraw from pool (simplified - would call actual pool contract)
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        let token_client = token::Client::new(&env, &circle.token);
+        
+        // In real implementation, this would withdraw from the actual yield pool
+        let total_withdrawn = delegation.delegation_amount + delegation.total_yield_earned;
+        
+        // Return funds to contract
+        // token_client.transfer(&delegation.pool_address, &env.current_contract_address(), &total_withdrawn);
+
+        delegation.status = YieldDelegationStatus::Completed;
+        delegation.end_time = Some(current_time);
+
+        env.storage().instance().set(&delegation_key, &delegation);
+
+        // Distribute earnings
+        distribute_yield_earnings(env, circle_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DELEGATION_WITHDRAWN"), circle_id),
+            (total_withdrawn, delegation.total_yield_earned),
+        );
+    }
+
+    fn distribute_yield_earnings(env: Env, circle_id: u64) {
+        let delegation_key = DataKey::YieldDelegation(circle_id);
+        let delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
+            .expect("No yield delegation found");
+
+        if delegation.total_yield_earned <= delegation.yield_distributed {
+            panic!("No new yield to distribute");
+        }
+
+        let new_yield = delegation.total_yield_earned - delegation.yield_distributed;
+        
+        // Calculate 50/50 split
+        let recipient_share = (new_yield * YIELD_DISTRIBUTION_RECIPIENT_BPS as i128) / 10000;
+        let treasury_share = (new_yield * YIELD_DISTRIBUTION_TREASURY_BPS as i128) / 10000;
+
+        // Get current round recipient
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+        
+        if let Some(recipient) = &circle.current_pot_recipient {
+            // Transfer to current recipient
+            let token_client = token::Client::new(&env, &circle.token);
+            // token_client.transfer(&env.current_contract_address(), recipient, &recipient_share);
+        }
+
+        // Add to group treasury
+        let treasury_key = DataKey::GroupTreasury(circle_id);
+        let mut treasury: i128 = env.storage().instance().get(&treasury_key).unwrap_or(0);
+        treasury += treasury_share;
+        env.storage().instance().set(&treasury_key, &treasury);
+
+        // Update delegation record
+        let mut updated_delegation = delegation;
+        updated_delegation.yield_distributed += new_yield;
+        env.storage().instance().set(&delegation_key, &updated_delegation);
+
+        // Create distribution record
+        let distribution = YieldDistribution {
+            circle_id,
+            recipient_share,
+            treasury_share,
+            total_yield: new_yield,
+            distribution_time: env.ledger().timestamp(),
+            round_number: circle.current_recipient_index,
+        };
+
+        env.events().publish(
+            (Symbol::new(&env, "YIELD_DISTRIBUTED"), circle_id),
+            (recipient_share, treasury_share, new_yield),
+        );
+
+        write_audit(&env, &env.current_contract_address(), AuditAction::AdminAction, circle_id);
+    }
+}
+
+fn execute_yield_delegation_internal(env: &Env, circle_id: u64, delegation: &mut YieldDelegation) {
+    let current_time = env.ledger().timestamp();
+    
+    // Transfer funds to yield pool
+    let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+        .expect("Circle not found");
+    let token_client = token::Client::new(env, &circle.token);
+    
+    // In real implementation, this would call the actual yield pool contract
+    // token_client.transfer(&env.current_contract_address(), &delegation.pool_address, &delegation.delegation_amount);
+    
+    delegation.status = YieldDelegationStatus::Active;
+    delegation.start_time = Some(current_time);
+    delegation.last_compound_time = current_time;
+}
+
+fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elapsed: u64) -> i128 {
+    // Simplified yield calculation - in real implementation would query actual pool
+    let apy_bps = 500; // 5% APY
+    let seconds_in_year = 365 * 24 * 60 * 60;
+    let time_fraction = time_elapsed as i128 * 10000 / seconds_in_year as i128;
+    (delegation.delegation_amount * apy_bps as i128 * time_fraction) / (10000 * 10000)
+}
+
+    #[test]
+    fn test_get_reputation() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Test reputation for new user (should be zero/low)
+        let reputation = client.get_reputation(&user);
+        assert_eq!(reputation.susu_score, 0);
+        assert_eq!(reputation.reliability_score, 0);
+        assert_eq!(reputation.total_contributions, 0);
+        assert_eq!(reputation.on_time_rate, 0);
+        assert_eq!(reputation.volume_saved, 0);
+        assert_eq!(reputation.is_active, false);
+        
+        // Create circle and add user
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &10,
+            &token_contract,
+            &86400,
+            &100, // 1%
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&user, &circle_id, &1, &None);
+        client.deposit(&user, &circle_id);
+        
+        // Test reputation after contribution
+        let reputation = client.get_reputation(&user);
+        assert!(reputation.susu_score > 0);
+        assert!(reputation.reliability_score > 0);
+        assert_eq!(reputation.total_contributions, 1);
+        assert_eq!(reputation.on_time_rate, 10000); // 100% on-time rate
+        assert_eq!(reputation.volume_saved, 1_000_000_000_000);
+        assert_eq!(reputation.is_active, true);
+    }
+
+    #[test]
+    fn test_credit_score_oracle() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
         
         env.mock_all_auths();
         client.init(&admin);
@@ -1492,5 +2478,302 @@ impl SoroSusuTrait for SoroSusu {
 
         // After a successful on-time deposit, score surges past the 500 threshold
         assert_eq!(lending_client.can_borrow(&oracle_id, &user), true);
+    }
+
+    #[test]
+    fn test_sub_susu_credit_line() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(&creator, &1000, &2, &token_contract, &86400, &100, &nft_contract, &arbitrator);
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Payout to creator first to establish history and boost user score
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Now user asks for credit advance. Expected payout = 2000. Limit is 1000.
+        client.approve_credit_advance(&creator, &circle_id, &user, &1000);
+        
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user, &circle_id); // debt is deducted seamlessly!
+    }
+
+    #[test]
+    fn test_rollover_bonus_proposal_and_voting() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Set up protocol fee for rollover bonus calculation
+        client.set_protocol_fee(&admin, &100, &admin); // 1% fee
+        
+        // Create circle with 2 members
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens
+            &2,
+            &token_contract,
+            &86400,
+            &100, // 1% insurance
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user1, &circle_id);
+        
+        // Now propose rollover bonus (50% of platform fee)
+        client.propose_rollover_bonus(&creator, &circle_id, &5000);
+        
+        // Second member votes for the rollover
+        client.vote_rollover_bonus(&user1, &circle_id, &RolloverVoteChoice::For);
+        
+        // Apply the rollover bonus
+        client.apply_rollover_bonus(&circle_id);
+        
+        // Start third cycle - first recipient should get rollover bonus
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Check that rollover bonus is applied to payout
+        let initial_balance = token_contract.mock_balance(&creator);
+        client.claim_pot(&creator, &circle_id);
+        let final_balance = token_contract.mock_balance(&creator);
+        
+        // Should receive regular pot (2000) minus fee (1% = 20) plus rollover bonus (50% of fee = 10)
+        let expected_payout = 2000 - 20 + 10; // 1990
+        assert_eq!(final_balance - initial_balance, expected_payout);
+    }
+
+    #[test]
+    fn test_rollover_bonus_rejection() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        client.set_protocol_fee(&admin, &100, &admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &2,
+            &token_contract,
+            &86400,
+            &100,
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Propose rollover bonus
+        client.propose_rollover_bonus(&creator, &circle_id, &5000);
+        
+        // Second member votes against - should not meet majority threshold
+        client.vote_rollover_bonus(&user1, &circle_id, &RolloverVoteChoice::Against);
+        
+        // Try to apply should fail since not approved
+        std::panic::catch_unwind(|| {
+            client.apply_rollover_bonus(&circle_id);
+        }).expect_err("Should panic when trying to apply unapproved rollover");
+    }
+
+    #[test]
+    fn test_yield_delegation_proposal_and_voting() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        // Create circle with 3 members for higher quorum requirements
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000, // 1000 tokens
+            &3,
+            &token_contract,
+            &86400,
+            &100, // 1% insurance
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        client.join_circle(&user2, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.deposit(&user2, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle and finalize again
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.deposit(&user2, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Propose yield delegation (50% of pot)
+        let pool_address = Address::generate(&env);
+        client.propose_yield_delegation(
+            &creator, 
+            &circle_id, 
+            &5000, // 50%
+            &pool_address,
+            &YieldPoolType::StellarLiquidityPool
+        );
+        
+        // Other members vote for the delegation
+        client.vote_yield_delegation(&user1, &circle_id, &YieldVoteChoice::For);
+        client.vote_yield_delegation(&user2, &circle_id, &YieldVoteChoice::For);
+        
+        // Approve and execute delegation
+        client.approve_yield_delegation(&circle_id);
+        client.execute_yield_delegation(&circle_id);
+        
+        // Test compounding
+        env.ledger().set_timestamp(env.ledger().timestamp() + YIELD_COMPOUNDING_FREQUENCY + 1);
+        client.compound_yield(&circle_id);
+        
+        // Test withdrawal and distribution
+        client.withdraw_yield_delegation(&circle_id);
+    }
+
+    #[test]
+    fn test_yield_delegation_rejection() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(
+            &creator,
+            &1_000_000_000_000,
+            &2,
+            &token_contract,
+            &86400,
+            &100,
+            &nft_contract,
+            &arbitrator,
+        );
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user1, &circle_id, &1, &None);
+        
+        // Complete first cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Start second cycle
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user1, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        
+        // Propose yield delegation
+        let pool_address = Address::generate(&env);
+        client.propose_yield_delegation(
+            &creator, 
+            &circle_id, 
+            &5000,
+            &pool_address,
+            &YieldPoolType::StellarLiquidityPool
+        );
+        
+        // Second member votes against - should not meet 80% majority
+        client.vote_yield_delegation(&user1, &circle_id, &YieldVoteChoice::Against);
+        
+        // Try to approve should fail since not approved
+        std::panic::catch_unwind(|| {
+            client.approve_yield_delegation(&circle_id);
+        }).expect_err("Should panic when trying to approve rejected delegation");
     }
 }
