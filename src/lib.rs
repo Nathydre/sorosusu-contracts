@@ -76,6 +76,13 @@ pub struct UserStats {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct CreditAdvance {
+    pub principal: i128,
+    pub fee: i128,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum MemberStatus {
     Active,
@@ -1438,5 +1445,42 @@ impl SoroSusuTrait for SoroSusu {
 
         // After a successful on-time deposit, score surges past the 500 threshold
         assert_eq!(lending_client.can_borrow(&oracle_id, &user), true);
+    }
+
+    #[test]
+    fn test_sub_susu_credit_line() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        
+        let token_contract = env.register_contract(None, MockToken);
+        let nft_contract = env.register_contract(None, MockNft);
+        
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        
+        env.mock_all_auths();
+        client.init(&admin);
+        
+        let circle_id = client.create_circle(&creator, &1000, &2, &token_contract, &86400, &100, &nft_contract, &arbitrator);
+        
+        client.join_circle(&creator, &circle_id, &1, &None);
+        client.join_circle(&user, &circle_id, &1, &None);
+        
+        // Payout to creator first to establish history and boost user score
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&creator, &circle_id);
+        
+        // Now user asks for credit advance. Expected payout = 2000. Limit is 1000.
+        client.approve_credit_advance(&creator, &circle_id, &user, &1000);
+        
+        client.deposit(&creator, &circle_id);
+        client.deposit(&user, &circle_id);
+        client.finalize_round(&creator, &circle_id);
+        client.claim_pot(&user, &circle_id); // debt is deducted seamlessly!
     }
 }
