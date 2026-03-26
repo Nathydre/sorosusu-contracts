@@ -6,6 +6,11 @@ use soroban_sdk::{
     Address, Env, String, Symbol, Vec,
 };
 
+pub mod financial_statement;
+
+#[cfg(test)]
+mod financial_statement_tests;
+
 // --- ERROR CODES ---
 
 #[contracterror]
@@ -122,6 +127,9 @@ pub enum DataKey {
     PathPaymentVote(u64, Address),
     DexRegistry,
     SupportedTokens,
+    // Financial Statement tracking
+    FinancialTransaction(u64, Address), // circle_id, member_address
+    TransactionIndex(u64), // circle_id -> transaction_count
 }
 
 #[contracttype]
@@ -130,6 +138,31 @@ pub struct UserStats {
     pub total_volume_saved: i128,
     pub on_time_contributions: u32,
     pub late_contributions: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinancialTransaction {
+    pub transaction_type: FinancialTransactionType,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub token_address: Address,
+    pub is_late: bool,
+    pub penalty_amount: i128,
+    pub insurance_fee: i128,
+    pub transaction_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FinancialTransactionType {
+    Contribution,
+    Payout,
+    Penalty,
+    InsuranceFee,
 }
 
 #[contracttype]
@@ -1361,6 +1394,63 @@ impl SoroSusuTrait for SoroSusu {
         member.last_contribution_time = current_time;
         circle.contribution_bitmap |= 1u64 << member.index;
 
+        // Track financial transaction for Source of Funds verification
+        let transaction_id = Self::get_next_transaction_id(&env, circle_id);
+        let is_late = current_time > circle.deadline_timestamp;
+        
+        let contribution_tx = FinancialTransaction {
+            transaction_type: FinancialTransactionType::Contribution,
+            amount: base_amount,
+            timestamp: current_time,
+            member: user.clone(),
+            circle_id,
+            round_number: circle.current_recipient_index,
+            token_address: circle.token.clone(),
+            is_late,
+            penalty_amount,
+            insurance_fee,
+            transaction_id,
+        };
+        
+        Self::store_financial_transaction(&env, circle_id, user.clone(), contribution_tx);
+        
+        // Track penalty and insurance as separate transactions if they exist
+        if penalty_amount > 0 {
+            let penalty_tx_id = Self::get_next_transaction_id(&env, circle_id);
+            let penalty_tx = FinancialTransaction {
+                transaction_type: FinancialTransactionType::Penalty,
+                amount: penalty_amount,
+                timestamp: current_time,
+                member: user.clone(),
+                circle_id,
+                round_number: circle.current_recipient_index,
+                token_address: circle.token.clone(),
+                is_late: true,
+                penalty_amount,
+                insurance_fee: 0,
+                transaction_id: penalty_tx_id,
+            };
+            Self::store_financial_transaction(&env, circle_id, user.clone(), penalty_tx);
+        }
+        
+        if insurance_fee > 0 {
+            let insurance_tx_id = Self::get_next_transaction_id(&env, circle_id);
+            let insurance_tx = FinancialTransaction {
+                transaction_type: FinancialTransactionType::InsuranceFee,
+                amount: insurance_fee,
+                timestamp: current_time,
+                member: user.clone(),
+                circle_id,
+                round_number: circle.current_recipient_index,
+                token_address: circle.token.clone(),
+                is_late: false,
+                penalty_amount: 0,
+                insurance_fee,
+                transaction_id: insurance_tx_id,
+            };
+            Self::store_financial_transaction(&env, circle_id, user.clone(), insurance_tx);
+        }
+
         env.storage().instance().set(&member_key, &member);
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
@@ -1473,15 +1563,36 @@ impl SoroSusuTrait for SoroSusu {
         let token_client = token::Client::new(&env, &circle.token);
         
         let fee_bps: u32 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        let mut net_payout = total_payout;
+        let mut fee_amount = 0i128;
+        
         if fee_bps > 0 {
             let treasury: Address = env.storage().instance().get(&DataKey::ProtocolTreasury).expect("Treasury not set");
-            let fee = (total_payout * fee_bps as i128) / 10000;
-            let net_payout = total_payout - fee;
-            token_client.transfer(&env.current_contract_address(), &treasury, &fee);
+            fee_amount = (total_payout * fee_bps as i128) / 10000;
+            net_payout = total_payout - fee_amount;
+            token_client.transfer(&env.current_contract_address(), &treasury, &fee_amount);
             token_client.transfer(&env.current_contract_address(), &user, &net_payout);
         } else {
             token_client.transfer(&env.current_contract_address(), &user, &total_payout);
         }
+
+        // Track financial transaction for Source of Funds verification
+        let transaction_id = Self::get_next_transaction_id(&env, circle_id);
+        let payout_tx = FinancialTransaction {
+            transaction_type: FinancialTransactionType::Payout,
+            amount: net_payout,
+            timestamp: env.ledger().timestamp(),
+            member: user.clone(),
+            circle_id,
+            round_number: circle.current_recipient_index,
+            token_address: circle.token.clone(),
+            is_late: false,
+            penalty_amount: 0,
+            insurance_fee: 0,
+            transaction_id,
+        };
+        
+        Self::store_financial_transaction(&env, circle_id, user.clone(), payout_tx);
 
         // Auto-release collateral if member has completed all contributions
         if circle.requires_collateral {
@@ -2789,6 +2900,67 @@ fn calculate_yield_from_pool(env: &Env, delegation: &YieldDelegation, time_elaps
     let seconds_in_year = 365 * 24 * 60 * 60;
     let time_fraction = time_elapsed as i128 * 10000 / seconds_in_year as i128;
     (delegation.delegation_amount * apy_bps as i128 * time_fraction) / (10000 * 10000)
+}
+
+// --- FINANCIAL TRANSACTION HELPER FUNCTIONS ---
+
+impl SoroSusu {
+    fn get_next_transaction_id(env: &Env, circle_id: u64) -> u64 {
+        let tx_index_key = DataKey::TransactionIndex(circle_id);
+        let current_id: u64 = env.storage().instance().get(&tx_index_key).unwrap_or(0);
+        let next_id = current_id + 1;
+        env.storage().instance().set(&tx_index_key, &next_id);
+        next_id
+    }
+
+    fn store_financial_transaction(env: &Env, circle_id: u64, member: Address, transaction: FinancialTransaction) {
+        let tx_key = DataKey::FinancialTransaction(circle_id, member.clone());
+        
+        // Get existing transactions for this member in this circle
+        let mut transactions: Vec<FinancialTransaction> = env.storage().instance()
+            .get(&tx_key)
+            .unwrap_or_else(|| Vec::new(env));
+        
+        transactions.push_back(transaction);
+        
+        // Store updated transaction list
+        env.storage().instance().set(&tx_key, &transactions);
+        
+        // Publish event for financial statement tracking
+        env.events().publish(
+            (Symbol::new(env, "FINANCIAL_TRANSACTION"), circle_id, member),
+            (
+                transaction.transaction_type as u32,
+                transaction.amount,
+                transaction.timestamp,
+                transaction.round_number,
+            ),
+        );
+    }
+
+    fn get_member_financial_transactions(
+        env: &Env,
+        member: Address,
+        circle_id: u64,
+        period_start: u64,
+        period_end: u64,
+    ) -> Vec<FinancialTransaction> {
+        let tx_key = DataKey::FinancialTransaction(circle_id, member.clone());
+        
+        if let Some(transactions) = env.storage().instance().get::<DataKey, Vec<FinancialTransaction>>(&tx_key) {
+            let mut filtered_transactions = Vec::new(env);
+            
+            for tx in transactions {
+                if tx.timestamp >= period_start && tx.timestamp <= period_end {
+                    filtered_transactions.push_back(tx);
+                }
+            }
+            
+            filtered_transactions
+        } else {
+            Vec::new(env)
+        }
+    }
 }
 
     #[test]
