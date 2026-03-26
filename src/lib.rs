@@ -1,6 +1,13 @@
 #![no_std]
 use soroban_sdk::{contract, contracttype, contractimpl, contractclient, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress, Arbitrary as TestArbitrary}, arbitrary::{Arbitrary, Unstructured}, Map};
 
+// --- ERROR CODES ---
+pub const CLAWBACK_DETECTED: u32 = 2001;
+pub const ROUND_ALREADY_PAUSED: u32 = 2002;
+pub const ROUND_NOT_PAUSED: u32 = 2003;
+pub const INSUFFICIENT_RECOVERY_FUNDS: u32 = 2004;
+pub const RECOVERY_PLAN_NOT_ACTIVE: u32 = 2005;
+
 // --- DATA STRUCTURES ---
 
 #[contracttype]
@@ -19,6 +26,10 @@ pub enum DataKey {
     MiningConfig,
     TotalMinedTokens,
     UserMiningStats(Address),
+    // Clawback Reconciliation Keys
+    ClawbackDeficit(u64), // circle_id -> deficit amount
+    RecoveryPlan(u64),    // circle_id -> recovery plan
+    PausedRounds(u64),    // circle_id -> pause info
 }
 
 #[contracttype]
@@ -54,6 +65,8 @@ pub struct CircleInfo {
     pub proposal_votes_bitmap: u64,
     pub nft_contract: Address,
     pub cycle_count: u32, // Track completed cycles for vesting
+    pub is_paused: bool, // Pause state for clawback events
+    pub expected_balance: u64, // Expected token balance for deficit detection
 }
 
 #[contracttype]
@@ -87,6 +100,58 @@ pub struct UserMiningStats {
     pub last_mining_timestamp: u64,
 }
 
+// --- CLAWBACK RECONCILIATION STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ClawbackDeficit {
+    pub circle_id: u64,
+    pub deficit_amount: u64,
+    pub detection_timestamp: u64,
+    pub detected_by: Address,
+    pub token_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RecoveryPlan {
+    pub circle_id: u64,
+    pub total_deficit: u64,
+    pub recovery_type: RecoveryType,
+    pub proposed_by: Address,
+    pub proposal_timestamp: u64,
+    pub votes_for: u16,
+    pub votes_against: u16,
+    pub is_active: bool,
+    pub recovery_contributions: Map<Address, u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum RecoveryType {
+    MemberContribution, // Members chip in extra funds
+    PayoutReduction,    // Next payout is reduced
+    InsuranceUsage,     // Use insurance funds
+    Hybrid,             // Combination of approaches
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PausedRound {
+    pub circle_id: u64,
+    pub pause_timestamp: u64,
+    pub pause_reason: PauseReason,
+    pub paused_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum PauseReason {
+    ClawbackDetected,
+    DeficitReconciliation,
+    EmergencyMaintenance,
+}
+
 // --- CONTRACT TRAITS ---
 
 pub trait SoroSusuTrait {
@@ -106,6 +171,18 @@ pub trait SoroSusuTrait {
     fn get_user_vesting_info(env: Env, user: Address) -> UserVestingInfo;
     fn get_mining_stats(env: Env, user: Address) -> UserMiningStats;
     fn complete_circle_cycle(env: Env, circle_id: u64);
+    
+    // Clawback Reconciliation Functions
+    fn detect_and_handle_clawback(env: Env, caller: Address, circle_id: u64);
+    fn pause_round(env: Env, caller: Address, circle_id: u64, reason: PauseReason);
+    fn propose_recovery_plan(env: Env, caller: Address, circle_id: u64, recovery_type: RecoveryType);
+    fn vote_recovery_plan(env: Env, caller: Address, circle_id: u64, vote_for: bool);
+    fn contribute_to_recovery(env: Env, caller: Address, circle_id: u64, amount: u64);
+    fn execute_recovery_plan(env: Env, caller: Address, circle_id: u64);
+    fn resume_round(env: Env, caller: Address, circle_id: u64);
+    fn get_clawback_deficit(env: Env, circle_id: u64) -> ClawbackDeficit;
+    fn get_recovery_plan(env: Env, circle_id: u64) -> RecoveryPlan;
+    fn get_paused_round_info(env: Env, circle_id: u64) -> PausedRound;
 }
 
 #[contractclient(name = "SusuNftClient")]
@@ -178,6 +255,8 @@ impl SoroSusuTrait for SoroSusu {
             proposal_votes_bitmap: 0,
             nft_contract,
             cycle_count: 0,
+            is_paused: false,
+            expected_balance: 0,
         };
 
         env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
@@ -253,6 +332,11 @@ impl SoroSusuTrait for SoroSusu {
 
         let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
 
+        // Check if round is paused
+        if circle.is_paused {
+            panic!("Round is paused due to clawback detection");
+        }
+
         let member_key = DataKey::Member(user.clone());
         let mut member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
@@ -276,6 +360,9 @@ impl SoroSusuTrait for SoroSusu {
 
         let insurance_fee = ((circle.contribution_amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
         let total_amount = circle.contribution_amount + insurance_fee;
+
+        // Update expected balance before transfer
+        circle.expected_balance += total_amount;
 
         client.transfer(&user, &env.current_contract_address(), &total_amount);
 
@@ -535,6 +622,326 @@ impl SoroSusuTrait for SoroSusu {
         let client = SusuNftClient::new(&env, &circle.nft_contract);
         client.burn(&member, &token_id);
     }
+
+    // --- CLAWBACK RECONCILIATION IMPLEMENTATIONS ---
+
+    fn detect_and_handle_clawback(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Only circle creator or admin can detect clawbacks
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != circle.creator && caller != admin {
+            panic!("Unauthorized: Only creator or admin can detect clawbacks");
+        }
+
+        let token_client = token::Client::new(&env, &circle.token);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+        
+        if actual_balance < circle.expected_balance {
+            let deficit_amount = circle.expected_balance - actual_balance;
+            
+            // Create deficit record
+            let deficit = ClawbackDeficit {
+                circle_id,
+                deficit_amount,
+                detection_timestamp: env.ledger().timestamp(),
+                detected_by: caller.clone(),
+                token_address: circle.token.clone(),
+            };
+            
+            env.storage().instance().set(&DataKey::ClawbackDeficit(circle_id), &deficit);
+            
+            // Auto-pause round
+            Self::pause_round(env.clone(), caller.clone(), circle_id, PauseReason::ClawbackDetected);
+            
+            // Emit clawback detection event
+            env.events().publish(
+                (Symbol::short("clawback_detected"), circle_id, caller),
+                deficit_amount,
+            );
+        }
+    }
+
+    fn pause_round(env: Env, caller: Address, circle_id: u64, reason: PauseReason) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Only circle creator or admin can pause rounds
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != circle.creator && caller != admin {
+            panic!("Unauthorized: Only creator or admin can pause rounds");
+        }
+
+        if circle.is_paused {
+            panic!("Round is already paused");
+        }
+
+        circle.is_paused = true;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        let paused_round = PausedRound {
+            circle_id,
+            pause_timestamp: env.ledger().timestamp(),
+            pause_reason: reason.clone(),
+            paused_by: caller.clone(),
+        };
+        
+        env.storage().instance().set(&DataKey::PausedRounds(circle_id), &paused_round);
+
+        // Emit pause event
+        env.events().publish(
+            (Symbol::short("round_paused"), circle_id, caller),
+            reason,
+        );
+    }
+
+    fn propose_recovery_plan(env: Env, caller: Address, circle_id: u64, recovery_type: RecoveryType) {
+        caller.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Check if caller is a member or admin
+        let member_key = DataKey::Member(caller.clone());
+        let is_member = env.storage().instance().has(&member_key);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        
+        if !is_member && caller != admin {
+            panic!("Unauthorized: Only members or admin can propose recovery plans");
+        }
+
+        let deficit_key = DataKey::ClawbackDeficit(circle_id);
+        let deficit: ClawbackDeficit = env.storage().instance().get(&deficit_key)
+            .unwrap_or_else(|| panic!("No deficit detected for this circle"));
+
+        let recovery_plan = RecoveryPlan {
+            circle_id,
+            total_deficit: deficit.deficit_amount,
+            recovery_type: recovery_type.clone(),
+            proposed_by: caller.clone(),
+            proposal_timestamp: env.ledger().timestamp(),
+            votes_for: 0,
+            votes_against: 0,
+            is_active: true,
+            recovery_contributions: Map::new(&env),
+        };
+
+        env.storage().instance().set(&DataKey::RecoveryPlan(circle_id), &recovery_plan);
+
+        // Emit recovery plan proposal event
+        env.events().publish(
+            (Symbol::short("recovery_proposed"), circle_id, caller),
+            recovery_type,
+        );
+    }
+
+    fn vote_recovery_plan(env: Env, caller: Address, circle_id: u64, vote_for: bool) {
+        caller.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let member_key = DataKey::Member(caller.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        if !member.is_active {
+            panic!("Member is ejected");
+        }
+
+        let mut recovery_plan: RecoveryPlan = env.storage().instance().get(&DataKey::RecoveryPlan(circle_id))
+            .unwrap_or_else(|| panic!("No active recovery plan for this circle"));
+
+        if !recovery_plan.is_active {
+            panic!("Recovery plan is not active");
+        }
+
+        // Simple voting: each member gets one vote
+        if vote_for {
+            recovery_plan.votes_for += 1;
+        } else {
+            recovery_plan.votes_against += 1;
+        }
+
+        // Check if plan is approved (simple majority)
+        let total_votes = recovery_plan.votes_for + recovery_plan.votes_against;
+        if total_votes > (circle.member_count / 2) && recovery_plan.votes_for > recovery_plan.votes_against {
+            // Plan approved - execute it
+            Self::execute_recovery_plan(env.clone(), caller.clone(), circle_id);
+        } else {
+            env.storage().instance().set(&DataKey::RecoveryPlan(circle_id), &recovery_plan);
+        }
+
+        // Emit vote event
+        env.events().publish(
+            (Symbol::short("recovery_vote"), circle_id, caller),
+            vote_for,
+        );
+    }
+
+    fn contribute_to_recovery(env: Env, caller: Address, circle_id: u64, amount: u64) {
+        caller.require_auth();
+
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let member_key = DataKey::Member(caller.clone());
+        let member: Member = env.storage().instance().get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        if !member.is_active {
+            panic!("Member is ejected");
+        }
+
+        let mut recovery_plan: RecoveryPlan = env.storage().instance().get(&DataKey::RecoveryPlan(circle_id))
+            .unwrap_or_else(|| panic!("No active recovery plan for this circle"));
+
+        if !recovery_plan.is_active {
+            panic!("Recovery plan is not active");
+        }
+
+        // Transfer recovery contribution
+        let token_client = token::Client::new(&env, &circle.token);
+        token_client.transfer(&caller, &env.current_contract_address(), &amount);
+
+        // Record contribution
+        let current_contribution = recovery_plan.recovery_contributions.get(caller.clone()).unwrap_or(0);
+        recovery_plan.recovery_contributions.set(caller.clone(), current_contribution + amount);
+
+        env.storage().instance().set(&DataKey::RecoveryPlan(circle_id), &recovery_plan);
+
+        // Emit contribution event
+        env.events().publish(
+            (Symbol::short("recovery_contribution"), circle_id, caller),
+            amount,
+        );
+    }
+
+    fn execute_recovery_plan(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let mut recovery_plan: RecoveryPlan = env.storage().instance().get(&DataKey::RecoveryPlan(circle_id))
+            .unwrap_or_else(|| panic!("No active recovery plan for this circle"));
+
+        if !recovery_plan.is_active {
+            panic!("Recovery plan is not active");
+        }
+
+        match recovery_plan.recovery_type {
+            RecoveryType::MemberContribution => {
+                // Check if sufficient contributions have been made
+                let mut total_contributions = 0u64;
+                for (_, amount) in recovery_plan.recovery_contributions.iter() {
+                    total_contributions += amount;
+                }
+
+                if total_contributions < recovery_plan.total_deficit {
+                    panic!("Insufficient recovery contributions");
+                }
+
+                // Update expected balance to reflect new reality
+                let token_client = token::Client::new(&env, &circle.token);
+                circle.expected_balance = token_client.balance(&env.current_contract_address());
+            },
+            RecoveryType::InsuranceUsage => {
+                // Use insurance funds to cover deficit
+                if circle.insurance_balance < recovery_plan.total_deficit {
+                    panic!("Insufficient insurance balance");
+                }
+                circle.insurance_balance -= recovery_plan.total_deficit;
+            },
+            RecoveryType::PayoutReduction => {
+                // This would be handled in payout logic
+                // For now, just mark the plan as executed
+            },
+            RecoveryType::Hybrid => {
+                // Combination approach - implement as needed
+                panic!("Hybrid recovery not yet implemented");
+            },
+        }
+
+        // Deactivate recovery plan
+        recovery_plan.is_active = false;
+        env.storage().instance().set(&DataKey::RecoveryPlan(circle_id), &recovery_plan);
+        
+        // Clear deficit record
+        env.storage().instance().remove(&DataKey::ClawbackDeficit(circle_id));
+
+        // Emit recovery execution event
+        env.events().publish(
+            (Symbol::short("recovery_executed"), circle_id, caller),
+            recovery_plan.total_deficit,
+        );
+    }
+
+    fn resume_round(env: Env, caller: Address, circle_id: u64) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Only circle creator or admin can resume rounds
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != circle.creator && caller != admin {
+            panic!("Unauthorized: Only creator or admin can resume rounds");
+        }
+
+        if !circle.is_paused {
+            panic!("Round is not paused");
+        }
+
+        // Check if there's an active deficit
+        let deficit_key = DataKey::ClawbackDeficit(circle_id);
+        if env.storage().instance().has(&deficit_key) {
+            panic!("Cannot resume: unresolved deficit exists");
+        }
+
+        circle.is_paused = false;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // Remove pause record
+        env.storage().instance().remove(&DataKey::PausedRounds(circle_id));
+
+        // Emit resume event
+        env.events().publish(
+            (Symbol::short("round_resumed"), circle_id, caller),
+            true,
+        );
+    }
+
+    fn get_clawback_deficit(env: Env, circle_id: u64) -> ClawbackDeficit {
+        env.storage().instance().get(&DataKey::ClawbackDeficit(circle_id))
+            .unwrap_or_else(|| ClawbackDeficit {
+                circle_id,
+                deficit_amount: 0,
+                detection_timestamp: 0,
+                detected_by: Address::generate(&env),
+                token_address: Address::generate(&env),
+            })
+    }
+
+    fn get_recovery_plan(env: Env, circle_id: u64) -> RecoveryPlan {
+        env.storage().instance().get(&DataKey::RecoveryPlan(circle_id))
+            .unwrap_or_else(|| RecoveryPlan {
+                circle_id,
+                total_deficit: 0,
+                recovery_type: RecoveryType::MemberContribution,
+                proposed_by: Address::generate(&env),
+                proposal_timestamp: 0,
+                votes_for: 0,
+                votes_against: 0,
+                is_active: false,
+                recovery_contributions: Map::new(&env),
+            })
+    }
+
+    fn get_paused_round_info(env: Env, circle_id: u64) -> PausedRound {
+        env.storage().instance().get(&DataKey::PausedRounds(circle_id))
+            .unwrap_or_else(|| PausedRound {
+                circle_id,
+                pause_timestamp: 0,
+                pause_reason: PauseReason::EmergencyMaintenance,
+                paused_by: Address::generate(&env),
+            })
+    }
 }
 
 // --- PRIVATE HELPER FUNCTIONS ---
@@ -672,4 +1079,6 @@ impl SoroSusu {
     }
 }
 
-// ... (rest of the code remains the same)
+// --- TESTS ---
+#[cfg(test)]
+mod clawback_tests;
