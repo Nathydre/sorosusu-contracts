@@ -5,57 +5,7 @@ mod liquidity_buffer;
 pub use liquidity_buffer::*;
 mod sbt_minter;
 
-pub use sbt_minter::*;
-
-// --- SOROSUSU SOULBOUND TOKEN (SBT) SYSTEM ---
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum SbtStatus {
-    Active,
-    Dishonored,
-    Revoked,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum ReputationTier {
-    Bronze,     // 0-2 cycles completed
-    Silver,     // 3-5 cycles completed  
-    Gold,       // 6-9 cycles completed
-    Platinum,   // 10+ cycles completed
-    Diamond,    // Legendary: 12+ cycles with perfect record
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct SoroSusuCredential {
-    pub token_id: u128,
-    pub holder: Address,
-    pub reputation_tier: ReputationTier,
-    pub total_cycles_completed: u32,
-    pub perfect_cycles: u32,
-    pub on_time_rate: u32,        // Basis points (10000 = 100%)
-    pub reliability_score: u32,     // 0-10000 bps
-    pub social_capital_score: u32,  // 0-10000 bps
-    pub total_volume_saved: i128,
-    pub last_activity: u64,
-    pub status: SbtStatus,
-    pub minted_timestamp: u64,
-    pub metadata_uri: String,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct ReputationMilestone {
-    pub milestone_id: u64,
-    pub user: Address,
-    pub cycles_required: u32,
-    pub description: String,
-    pub is_completed: bool,
-    pub completion_timestamp: Option<u64>,
-    pub reward_tier: ReputationTier,
-}
+pub use lending_market::*;
 
 // --- DATA STRUCTURES ---
 
@@ -270,9 +220,9 @@ const PRICE_DROP_THRESHOLD_BPS: u32 = 2000; // 20% price drop triggers circuit b
 const ASSET_SWAP_VOTING_PERIOD: u64 = 86400; // 24 hours for asset swap voting
 const ASSET_SWAP_QUORUM: u32 = 60; // 60% quorum for asset swap approval
 const ASSET_SWAP_MAJORITY: u32 = 66; // 66% majority for asset swap approval
-const DEFAULT_HARD_ASSET_GOLD_WEIGHT: u32 = 5000; // 50% gold
-const DEFAULT_HARD_ASSET_BTC_WEIGHT: u32 = 3000; // 30% BTC
-const DEFAULT_HARD_ASSET_SILVER_WEIGHT: u32 = 2000; // 20% silver
+const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
+const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
+const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
 
 // --- DATA STRUCTURES ---
 
@@ -349,6 +299,19 @@ pub enum DataKey {
     AnchorRegistry, // Registry of authorized anchors
     AnchorDeposit(u64), // Track anchor deposits per circle
     DepositMemo(u64), // Track deposit memos for compliance
+    // Inter-Susu Lending Market Liquidity Hook
+    LendingMarketProposal(u64),       // Lending market proposals
+    LendingMarketVote(u64, Address),       // Votes on lending market proposals
+    LendingPoolInfo(u64),             // Lending pool information
+    LendingPoolParticipant(u64, Address), // Pool participants
+    LendingMarketConfig,               // Global lending market configuration
+    LendingPosition(u64, Address),        // Individual lending positions
+    LendingOffer(u64),                 // Active lending offers
+    LiquidityProvider(u64, Address),     // Liquidity provider information
+    YieldFarm(u64),                   // Yield farming positions
+    EmergencyLoan(u64),                 // Emergency loan requests
+    RepaymentSchedule(u64),            // Loan repayment schedules
+    LendingMarketStats,               // Lending market statistics
 }
 
 #[contracttype]
