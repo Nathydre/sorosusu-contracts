@@ -1,6 +1,9 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, token, panic, Map, Vec, i128, u64, u32};
 
-mod lending_market;
+mod liquidity_buffer;
+
+pub use liquidity_buffer::*;
+mod sbt_minter;
 
 pub use lending_market::*;
 
@@ -200,39 +203,17 @@ const MAX_SLIPPAGE_TOLERANCE_BPS: u32 = 500; // 5% maximum slippage tolerance
 const MIN_PATH_PAYMENT_AMOUNT: i128 = 50_000_000; // Minimum 5 tokens for path payment
 const PATH_PAYMENT_TIMEOUT: u64 = 300; // 5 minutes timeout for path payment execution
 
-// Lending Market Constants
-const LENDING_MARKET_VOTING_PERIOD: u64 = 86400; // 24 hours for lending market decisions
-const LENDING_MARKET_QUORUM: u32 = 60; // 60% quorum for major lending decisions
-const LENDING_MARKET_MAJORITY: u32 = 75; // 75% supermajority for lending market changes
-const LENDING_MARKET_MIN_PARTICIPATION: u32 = 40; // 40% minimum participation for validity
-const LENDING_MARKET_EMERGENCY_PERIOD: u64 = 21600; // 6 hours for emergency proposals
-const LENDING_MARKET_EMERGENCY_QUORUM: u32 = 80; // 80% supermajority for emergency actions
+// --- POT LIQUIDITY BUFFER FOR BANK HOLIDAYS ---
 
-// Lending pool configuration
-const MIN_LENDING_AMOUNT: i128 = 100_000_000; // Minimum 10 tokens to lend
-const MAX_LENDING_AMOUNT: i128 = 10_000_000_000; // Maximum 10,000 tokens per pool
-const MIN_LENDING_PARTICIPATION: u32 = 5; // Minimum 5 participants in a lending pool
-const MAX_LENDING_PARTICIPATION: u32 = 20; // Maximum 20 participants per pool
-const MIN_POOL_UTILIZATION: u32 = 2000; // Minimum 20% of pool must be utilized
-const DEFAULT_LENDING_FEE_BPS: u32 = 100; // 1% lending fee to pool
-const MIN_CREDIT_SCORE: u32 = 3000; // Minimum 30% credit score to participate
-const MAX_LENDING_DURATION: u64 = 1209600; // Maximum 14 days (2 weeks) for loans
-
-// Interest rate calculations
-const BASE_INTEREST_RATE_BPS: u32 = 500; // 5% base annual interest rate
-const CREDIT_SCORE_DISCOUNT_BPS: u32 = 10; // 0.1% discount per credit score point above 3000
-const MIN_INTEREST_RATE_BPS: u32 = 100; // 1% minimum interest rate
-const MAX_INTEREST_RATE_BPS: u32 = 2000; // 20% maximum interest rate
-
-// Risk assessment constants
-const DEFAULT_LTV_RATIO: u32 = 7000; // 70% loan-to-value ratio
-const HIGH_RISK_LTV_PENALTY: u32 = 1000; // 10% LTV penalty for high-risk borrowers
-const MAX_LTV_RATIO: u32 = 9000; // 90% maximum LTV ratio
-
-// Yield farming for liquidity providers
-const LIQUIDITY_PROVIDER_YIELD_BPS: u32 = 200; // 2% annual yield for liquidity providers
-const MIN_LIQUIDITY_LOCK: u64 = 1209600; // 14 days minimum lock period
-const YIELD_COMPOUNDING_FREQUENCY: u64 = 604800; // Weekly compounding
+const LIQUIDITY_BUFFER_ADVANCE_PERIOD: u64 = 172800; // 48 hours advance window
+const LIQUIDITY_BUFFER_MIN_REPUTATION: u32 = 10000; // 100% reputation required
+const LIQUIDITY_BUFFER_MAX_ADVANCE_BPS: u32 = 10000; // 100% of contribution can be advanced
+const LIQUIDITY_BUFFER_PLATFORM_FEE_ALLOCATION: u32 = 2000; // 20% of platform fees allocated to buffer
+const LIQUIDITY_BUFFER_MIN_RESERVE: i128 = 1_000_000_000; // Minimum 100 tokens in reserve
+const LIQUIDITY_BUFFER_MAX_RESERVE: i128 = 10_000_000_000; // Maximum 10,000 tokens in reserve
+const LIQUIDITY_BUFFER_ADVANCE_FEE_BPS: u32 = 50; // 0.5% fee for advance usage
+const LIQUIDITY_BUFFER_GRACE_PERIOD: u64 = 86400; // 24 hours grace period for repayment
+const LIQUIDITY_BUFFER_MAX_ADVANCES_PER_ROUND: u32 = 3; // Maximum advances per member per round
 
 // Asset Swap / Economic Circuit Breaker Constants
 const PRICE_DROP_THRESHOLD_BPS: u32 = 2000; // 20% price drop triggers circuit breaker
@@ -307,13 +288,13 @@ pub enum DataKey {
     MilestoneReached(u64),
     PaymentTiming(u64, u32, Address), // Payment timing per circle, round, and member
     PaymentOrderCounter(u64, u32), // Counter to track payment order in each round
-    // SBT Credential System Storage
-    SoroSusuCredential(u128),    // Token ID -> Credential mapping
-    UserCredential(Address),        // User -> Their SBT
-    ReputationMilestone(u64),      // Milestone ID -> Milestone data
-    MilestoneCounter,              // Counter for generating milestone IDs
-    UserReputationScore(Address),    // User -> Reputation metrics
-    SbtMinterAdmin,              // Admin address for SBT operations
+    LiquidityBufferConfig,           // Global liquidity buffer configuration
+    LiquidityBufferReserve,          // Current reserve balance
+    LiquidityAdvance(u64),           // Individual advance records
+    LiquidityAdvanceCounter,         // Counter for generating advance IDs
+    MemberAdvanceHistory(Address, u64), // Member's advance history
+    LiquidityBufferStats,            // Buffer utilization statistics
+    PlatformFeeAllocation,           // Platform fee allocation to buffer
     // Stellar Anchor Direct Deposit API (SEP-24/SEP-31)
     AnchorRegistry, // Registry of authorized anchors
     AnchorDeposit(u64), // Track anchor deposits per circle
@@ -952,6 +933,90 @@ pub struct PaymentTimingRecord {
     pub payment_order: u32, // Order in which this payment was made (1 = first, 2 = second, etc.)
 }
 
+// --- POT LIQUIDITY BUFFER DATA STRUCTURES ---
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiquidityAdvanceStatus {
+    Pending,        // Advance requested, waiting for deposit
+    Active,         // Advance provided, waiting for repayment
+    Completed,      // Advance fully repaid
+    Defaulted,      // Advance not repaid within grace period
+    Cancelled,      // Advance cancelled by member
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LiquidityBufferConfig {
+    pub is_enabled: bool,
+    pub advance_period: u64,              // 48 hours advance window
+    pub min_reputation: u32,               // 100% reputation required
+    pub max_advance_bps: u32,             // 100% of contribution can be advanced
+    pub platform_fee_allocation: u32,     // 20% of platform fees allocated to buffer
+    pub min_reserve: i128,                // Minimum reserve balance
+    pub max_reserve: i128,                // Maximum reserve balance
+    pub advance_fee_bps: u32,             // 0.5% fee for advance usage
+    pub grace_period: u64,                // 24 hours grace period for repayment
+    pub max_advances_per_round: u32,      // Maximum advances per member per round
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LiquidityAdvance {
+    pub advance_id: u64,
+    pub member: Address,
+    pub circle_id: u64,
+    pub round_number: u32,
+    pub contribution_amount: i128,         // Expected contribution amount
+    pub advance_amount: i128,             // Amount advanced to member
+    pub advance_fee: i128,                // Fee charged for advance
+    pub repayment_amount: i128,           // Total amount to be repaid
+    pub status: LiquidityAdvanceStatus,
+    pub requested_timestamp: u64,         // When advance was requested
+    pub provided_timestamp: Option<u64>,  // When advance was provided
+    pub repayment_deadline: u64,          // When repayment is due
+    pub repaid_timestamp: Option<u64>,    // When repayment was made
+    pub reason: String,                   // Reason for advance request
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MemberAdvanceHistory {
+    pub member: Address,
+    pub total_advances_taken: u32,
+    pub total_advance_amount: i128,
+    pub total_fees_paid: i128,
+    pub current_round_advances: u32,
+    pub last_advance_timestamp: Option<u64>,
+    pub repayment_history: Vec<u64>,      // List of advance IDs
+    pub default_count: u32,               // Number of defaulted advances
+    pub reputation_score: u32,            // Current reputation score
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LiquidityBufferStats {
+    pub total_reserve_balance: i128,
+    pub total_platform_fees_allocated: i128,
+    pub total_advances_provided: u64,
+    pub total_advances_completed: u64,
+    pub total_advances_defaulted: u64,
+    pub total_advance_amount: i128,
+    pub total_fees_collected: i128,
+    pub active_advances_count: u64,
+    pub average_advance_size: i128,
+    pub buffer_utilization_rate: u32,     // Current utilization as percentage
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PlatformFeeAllocation {
+    pub total_fees_collected: i128,
+    pub buffer_allocation_amount: i128,
+    pub treasury_allocation_amount: i128,
+    pub last_allocation_timestamp: u64,
+    pub allocation_frequency: u64,         // How often fees are allocated
 /// Stellar Anchor Information - SEP-24/SEP-31 compliant anchor registry
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -1068,50 +1133,23 @@ pub trait SoroSusuTrait {
     fn set_lending_pool(env: Env, admin: Address, pool: Address);
     fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address);
 
-    // --- INTER-SUSU LENDING MARKET LIQUIDITY HOOK ---
-    fn init_lending_market(env: Env, admin: Address);
-    fn create_lending_pool(
+    // --- POT LIQUIDITY BUFFER FOR BANK HOLIDAYS ---
+    fn init_liquidity_buffer(env: Env, admin: Address);
+    fn signal_advance_request(
         env: Env,
-        lender_circle_id: u64,
-        borrower_circle_id: u64,
-        initial_liquidity: i128,
-    ) -> u64;
-    fn lend_from_pool(
-        env: Env,
-        pool_id: u64,
-        borrower: Address,
-        amount: i128,
-        loan_duration: u64,
-    ) -> u64;
-    fn add_liquidity(
-        env: Env,
-        pool_id: u64,
-        provider: Address,
-        amount: i128,
-        lock_duration: u64,
-    ) -> u64;
-    fn process_repayment(
-        env: Env,
-        position_id: u64,
-        payment_amount: i128,
-    );
-    fn get_lending_pool(env: Env, pool_id: u64) -> LendingPoolInfo;
-    fn get_lending_position(env: Env, position_id: u64) -> LendingPosition;
-    fn get_repayment_schedule(env: Env, schedule_id: u64) -> RepaymentSchedule;
-    fn get_lending_market_stats(env: Env) -> LendingMarketStats;
-    fn request_emergency_loan(
-        env: Env,
-        requester_circle_id: u64,
-        borrower_circle_id: u64,
-        amount: i128,
+        member: Address,
+        circle_id: u64,
+        contribution_amount: i128,
         reason: String,
     ) -> u64;
-    fn vote_emergency_loan(
-        env: Env,
-        loan_id: u64,
-        vote: LendingVoteChoice,
-    );
-    fn get_emergency_loan(env: Env, loan_id: u64) -> EmergencyLoan;
+    fn provide_advance(env: Env, advance_id: u64);
+    fn cancel_advance_request(env: Env, advance_id: u64);
+    fn process_advance_refill(env: Env, member: Address, circle_id: u64, deposit_amount: i128);
+    fn get_liquidity_advance(env: Env, advance_id: u64) -> LiquidityAdvance;
+    fn get_member_advance_history(env: Env, member: Address) -> MemberAdvanceHistory;
+    fn get_liquidity_buffer_stats(env: Env) -> LiquidityBufferStats;
+    fn allocate_platform_fees_to_buffer(env: Env, fee_amount: i128);
+    fn check_advance_eligibility(env: Env, member: Address, circle_id: u64) -> bool;
 
     fn create_circle(
         env: Env,
