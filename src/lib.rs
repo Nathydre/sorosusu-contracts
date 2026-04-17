@@ -359,7 +359,26 @@ impl SoroSusuTrait for SoroSusu {
     fn unstake_xlm(_env: Env, u: Address, _tok: Address, _amt: i128) { u.require_auth(); }
     fn update_global_fee(env: Env, adm: Address, fee: u32) { adm.require_auth(); env.storage().instance().set(&DataKey::K(symbol_short!("Fee")), &fee); }
     fn request_leniency(env: Env, req: Address, cid: u64, reason: String) { req.require_auth(); let r = LeniencyRequest { requester: req.clone(), circle_id: cid, request_timestamp: env.ledger().timestamp(), voting_deadline: env.ledger().timestamp() + 86400, status: LeniencyRequestStatus::Pending, approve_votes: 0, reject_votes: 0, total_votes_cast: 0, extension_hours: 24, reason }; env.storage().instance().set(&DataKey::K2(symbol_short!("LenR"), cid, req), &r); }
-    fn vote_on_leniency(env: Env, voter: Address, cid: u64, req: Address, v: LeniencyVote) { voter.require_auth(); let mut r: LeniencyRequest = env.storage().instance().get(&DataKey::K2(symbol_short!("LenR"), cid, req.clone())).unwrap(); match v { LeniencyVote::Approve => r.approve_votes += 1, LeniencyVote::Reject => r.reject_votes += 1 }; r.total_votes_cast += 1; env.storage().instance().set(&DataKey::K2(symbol_short!("LenR"), cid, req), &r); }
+    fn vote_on_leniency(env: Env, voter: Address, cid: u64, req: Address, v: LeniencyVote) {
+        voter.require_auth();
+        if voter == req { panic!("Cannot vote for self"); }
+        let mut r: LeniencyRequest = env.storage().instance().get(&DataKey::K2(symbol_short!("LenR"), cid, req.clone())).unwrap();
+        match v {
+            LeniencyVote::Approve => r.approve_votes += 1,
+            LeniencyVote::Reject => r.reject_votes += 1,
+        };
+        r.total_votes_cast += 1;
+        if r.approve_votes >= 1 {
+            r.status = LeniencyRequestStatus::Approved;
+            let mut rs = Self::get_social_capital(env.clone(), req.clone(), cid);
+            rs.leniency_received += 1; rs.trust_score += 5;
+            env.storage().instance().set(&DataKey::K2(symbol_short!("Cap"), cid, req.clone()), &rs);
+            let mut vs = Self::get_social_capital(env.clone(), voter.clone(), cid);
+            vs.leniency_given += 1; vs.voting_participation += 1;
+            env.storage().instance().set(&DataKey::K2(symbol_short!("Cap"), cid, voter), &vs);
+        }
+        env.storage().instance().set(&DataKey::K2(symbol_short!("LenR"), cid, req), &r);
+    }
     fn finalize_leniency_vote(env: Env, caller: Address, cid: u64, req: Address) { caller.require_auth(); let mut r: LeniencyRequest = env.storage().instance().get(&DataKey::K2(symbol_short!("LenR"), cid, req.clone())).unwrap(); r.status = LeniencyRequestStatus::Approved; env.storage().instance().set(&DataKey::K2(symbol_short!("LenR"), cid, req), &r); }
     fn get_leniency_request(env: Env, cid: u64, req: Address) -> LeniencyRequest { env.storage().instance().get(&DataKey::K2(symbol_short!("LenR"), cid, req)).unwrap() }
     fn get_social_capital(env: Env, m: Address, cid: u64) -> SocialCapital { env.storage().instance().get(&DataKey::K2(symbol_short!("Cap"), cid, m.clone())).unwrap_or(SocialCapital { member: m, circle_id: cid, leniency_given: 0, leniency_received: 0, voting_participation: 0, trust_score: 50 }) }
