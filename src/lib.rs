@@ -383,8 +383,27 @@ impl SoroSusuTrait for SoroSusu {
     fn get_leniency_request(env: Env, cid: u64, req: Address) -> LeniencyRequest { env.storage().instance().get(&DataKey::K2(symbol_short!("LenR"), cid, req)).unwrap() }
     fn get_social_capital(env: Env, m: Address, cid: u64) -> SocialCapital { env.storage().instance().get(&DataKey::K2(symbol_short!("Cap"), cid, m.clone())).unwrap_or(SocialCapital { member: m, circle_id: cid, leniency_given: 0, leniency_received: 0, voting_participation: 0, trust_score: 50 }) }
     fn create_proposal(env: Env, prop: Address, cid: u64, pt: ProposalType, title: String, desc: String, ed: String) -> u64 { prop.require_auth(); let id = 1u64; env.storage().instance().set(&DataKey::K1(symbol_short!("Prop"), id), &Proposal { id, circle_id: cid, proposer: prop, proposal_type: pt, title, description: desc, created_timestamp: env.ledger().timestamp(), voting_start_timestamp: env.ledger().timestamp(), voting_end_timestamp: env.ledger().timestamp() + 86400, status: ProposalStatus::Active, for_votes: 0, against_votes: 0, total_voting_power: 0, quorum_met: false, execution_data: ed }); id }
-    fn quadratic_vote(env: Env, voter: Address, pid: u64, _weight: u32, _vc: QuadraticVoteChoice) { voter.require_auth(); let mut p: Proposal = env.storage().instance().get(&DataKey::K1(symbol_short!("Prop"), pid)).unwrap(); p.for_votes += 1; env.storage().instance().set(&DataKey::K1(symbol_short!("Prop"), pid), &p); }
-    fn execute_proposal(env: Env, caller: Address, pid: u64) { caller.require_auth(); let mut p: Proposal = env.storage().instance().get(&DataKey::K1(symbol_short!("Prop"), pid)).unwrap(); p.status = ProposalStatus::Executed; env.storage().instance().set(&DataKey::K1(symbol_short!("Prop"), pid), &p); }
+    fn quadratic_vote(env: Env, voter: Address, pid: u64, weight: u32, vc: QuadraticVoteChoice) {
+        voter.require_auth();
+        let mut p: Proposal = env.storage().instance().get(&DataKey::K1(symbol_short!("Prop"), pid)).unwrap();
+        let mut vp: VotingPower = env.storage().instance().get(&DataKey::K2(symbol_short!("Vote"), p.circle_id, voter.clone())).unwrap();
+        let cost = (weight as u64) * (weight as u64);
+        if vp.quadratic_power < cost { panic!("Insufficient voting power"); }
+        vp.quadratic_power -= cost;
+        env.storage().instance().set(&DataKey::K2(symbol_short!("Vote"), p.circle_id, voter), &vp);
+        match vc {
+            QuadraticVoteChoice::For => p.for_votes += cost,
+            QuadraticVoteChoice::Against => p.against_votes += cost,
+            QuadraticVoteChoice::Abstain => {}
+        }
+        env.storage().instance().set(&DataKey::K1(symbol_short!("Prop"), pid), &p);
+    }
+    fn execute_proposal(env: Env, caller: Address, pid: u64) {
+        caller.require_auth();
+        let mut p: Proposal = env.storage().instance().get(&DataKey::K1(symbol_short!("Prop"), pid)).unwrap();
+        p.status = ProposalStatus::Approved;
+        env.storage().instance().set(&DataKey::K1(symbol_short!("Prop"), pid), &p);
+    }
     fn get_proposal(env: Env, pid: u64) -> Proposal { env.storage().instance().get(&DataKey::K1(symbol_short!("Prop"), pid)).unwrap() }
     fn get_voting_power(env: Env, m: Address, cid: u64) -> VotingPower { env.storage().instance().get(&DataKey::K2(symbol_short!("Vote"), cid, m)).unwrap() }
     fn update_voting_power(env: Env, u: Address, cid: u64, bal: i128) { let pwr = if bal > 0 { 100 + (bal / 10000) as u64 } else { 100 }; let vp = VotingPower { member: u.clone(), circle_id: cid, token_balance: bal, quadratic_power: pwr, last_updated: env.ledger().timestamp() }; env.storage().instance().set(&DataKey::K2(symbol_short!("Vote"), cid, u), &vp); }
