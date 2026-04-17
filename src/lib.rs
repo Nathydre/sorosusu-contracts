@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
-    Address, Env, String, Symbol, Vec, Map, BytesN,
+    Address, Env, String, Symbol, Vec, Map, BytesN, IntoVal,
 };
 
 #[contracterror]
@@ -296,8 +296,8 @@ impl SoroSusu {
         creator.require_auth();
         let id = 1u64;
         env.storage().instance().set(&DataKey::K1(symbol_short!("C"), id), &CircleInfo {
-            id, creator: creator.clone(), contribution_amount: amt, max_members: max, member_count: 1, current_recipient_index: 0, is_active: true, token: tok,
-            deadline_timestamp: env.ledger().timestamp() + dur, cycle_duration: dur, member_addresses: Vec::from_array(&env, [creator]), recovery_votes_bitmap: 0,
+            id, creator: creator.clone(), contribution_amount: amt, max_members: max, member_count: 0, current_recipient_index: 0, is_active: true, token: tok,
+            deadline_timestamp: env.ledger().timestamp() + dur, cycle_duration: dur, member_addresses: Vec::new(&env), recovery_votes_bitmap: 0,
             recovery_old_address: None, recovery_new_address: None, grace_period_end: None, requires_collateral: amt > 1000, collateral_bps: 1000, quadratic_voting_enabled: false,
             proposal_count: 0, total_cycle_value: 0, winners_per_round: 1, batch_payout_enabled: false, current_pot_recipient: None, is_round_finalized: false, round_number: 0,
             dissolution_status: DissolutionStatus::Active, dissolution_deadline: None
@@ -311,8 +311,8 @@ impl SoroSusuTrait for SoroSusu {
     fn init(env: Env, admin: Address, fee: u32) { admin.require_auth(); env.storage().instance().set(&DataKey::K(symbol_short!("Admin")), &admin); env.storage().instance().set(&DataKey::K(symbol_short!("Fee")), &fee); }
     fn create_circle(env: Env, creator: Address, amt: i128, max: u32, tok: Address, dur: u64, bond: i128) -> u64 { Self::create_circle_logic(env, creator, amt, max, tok, dur, bond) }
     fn create_basket_circle(_env: Env, creator: Address, _amt: i128, _max: u32, _assets: Vec<Address>, _weights: Vec<u32>, _dur: u64, _ifee: u64, _nft: Address, _arb: Address) -> u64 { creator.require_auth(); 1 }
-    fn join_circle(env: Env, u: Address, cid: u64) { u.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); c.member_count += 1; c.member_addresses.push_back(u.clone()); env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u.clone()), &Member { address: u.clone(), index: c.member_count - 1, contribution_count: 0, last_contribution_time: 0, status: MemberStatus::Active, tier_multiplier: 1, referrer: None, buddy: None, has_contributed_current_round: false, total_contributions: 0 }); env.storage().instance().set(&DataKey::K1A(symbol_short!("Mem"), u.clone()), &Member { address: u, index: 0, contribution_count: 0, last_contribution_time: 0, status: MemberStatus::Active, tier_multiplier: 1, referrer: None, buddy: None, has_contributed_current_round: false, total_contributions: 0 }); }
-    fn deposit(env: Env, u: Address, cid: u64, _r: u32) { u.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); m.contribution_count += 1; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u), &m); }
+    fn join_circle(env: Env, u: Address, cid: u64) { u.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); if c.member_count >= c.max_members { panic!("Circle full"); } c.member_count += 1; c.member_addresses.push_back(u.clone()); env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u.clone()), &Member { address: u.clone(), index: c.member_count - 1, contribution_count: 0, last_contribution_time: 0, status: MemberStatus::Active, tier_multiplier: 1, referrer: None, buddy: None, has_contributed_current_round: false, total_contributions: 0 }); env.storage().instance().set(&DataKey::K1A(symbol_short!("Mem"), u.clone()), &Member { address: u, index: 0, contribution_count: 0, last_contribution_time: 0, status: MemberStatus::Active, tier_multiplier: 1, referrer: None, buddy: None, has_contributed_current_round: false, total_contributions: 0 }); }
+    fn deposit(env: Env, u: Address, cid: u64, _r: u32) { u.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); token::Client::new(&env, &c.token).transfer(&u, &env.current_contract_address(), &c.contribution_amount); m.contribution_count += 1; m.total_contributions += c.contribution_amount; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u), &m); }
     fn deposit_basket(_env: Env, u: Address, _cid: u64) { u.require_auth(); }
     fn propose_duration(env: Env, u: Address, _cid: u64, dur: u64) -> u64 { u.require_auth(); let id = 1u64; env.storage().instance().set(&DataKey::K1(symbol_short!("PDur"), id), &DurationProposal { id, new_duration: dur, votes_for: 1, votes_against: 0, end_time: env.ledger().timestamp() + 86400, is_active: true }); id }
     fn vote_duration(env: Env, u: Address, _cid: u64, pid: u64, app: bool) { u.require_auth(); let mut p: DurationProposal = env.storage().instance().get(&DataKey::K1(symbol_short!("PDur"), pid)).unwrap(); if app { p.votes_for += 1; } else { p.votes_against += 1; } env.storage().instance().set(&DataKey::K1(symbol_short!("PDur"), pid), &p); }
@@ -347,7 +347,21 @@ impl SoroSusuTrait for SoroSusu {
     fn set_leaseflow_contract(env: Env, adm: Address, rot: Address) { adm.require_auth(); env.storage().instance().set(&DataKey::K(symbol_short!("LRot")), &rot); }
     fn authorize_leaseflow_payout(env: Env, u: Address, cid: u64, li: Address) { u.require_auth(); env.storage().instance().set(&DataKey::K2(symbol_short!("LAuth"), cid, u), &li); }
     fn handle_leaseflow_default(env: Env, rot: Address, ten: Address, cid: u64) { rot.require_auth(); env.storage().instance().set(&DataKey::K2(symbol_short!("LDef"), cid, ten), &true); }
-    fn claim_pot(env: Env, u: Address, cid: u64) { u.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); token::Client::new(&env, &c.token).transfer(&env.current_contract_address(), &u, &(c.contribution_amount * (c.member_count as i128))); c.is_active = false; env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); }
+    fn claim_pot(env: Env, u: Address, cid: u64) {
+        u.require_auth();
+        let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap();
+        if let Some(oracle) = env.storage().instance().get::<DataKey, Address>(&DataKey::K(symbol_short!("Oracle"))) {
+            let is_sanctioned: bool = env.invoke_contract(&oracle, &Symbol::new(&env, "is_sanctioned"), Vec::from_array(&env, [u.clone().into_val(&env)]));
+            if is_sanctioned {
+                let pot = c.contribution_amount * (c.member_count as i128);
+                env.storage().instance().set(&DataKey::K1(symbol_short!("Froze"), cid), &(pot, Some(u)));
+                return;
+            }
+        }
+        token::Client::new(&env, &c.token).transfer(&env.current_contract_address(), &u, &(c.contribution_amount * (c.member_count as i128)));
+        c.is_active = false;
+        env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c);
+    }
     fn finalize_round(env: Env, u: Address, cid: u64) { u.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); c.is_round_finalized = true; c.current_pot_recipient = Some(u); env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); }
     fn configure_batch_payout(env: Env, creator: Address, cid: u64, winners: u32) { creator.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); c.winners_per_round = winners; c.batch_payout_enabled = true; env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); }
     fn distribute_batch_payout(_env: Env, caller: Address, _cid: u64) { caller.require_auth(); }
@@ -358,7 +372,7 @@ impl SoroSusuTrait for SoroSusu {
     fn get_basket_config(env: Env, cid: u64) -> Vec<AssetWeight> { env.storage().instance().get(&DataKey::K1(symbol_short!("Bsk"), cid)).unwrap() }
     fn register_anchor(env: Env, adm: Address, info: AnchorInfo) { adm.require_auth(); env.storage().instance().set(&DataKey::K1A(symbol_short!("Anch"), info.anchor_address.clone()), &info); }
     fn get_anchor_info(env: Env, a: Address) -> AnchorInfo { env.storage().instance().get(&DataKey::K1A(symbol_short!("Anch"), a)).unwrap() }
-    fn deposit_for_user(env: Env, anc: Address, u: Address, cid: u64, amt: i128, _mem: String, _fiat: String, _sep: String) { anc.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); m.has_contributed_current_round = true; m.total_contributions += amt; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u), &m); }
+    fn deposit_for_user(env: Env, anc: Address, u: Address, cid: u64, amt: i128, _mem: String, _fiat: String, _sep: String) { anc.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); token::Client::new(&env, &c.token).transfer(&anc, &env.current_contract_address(), &amt); m.has_contributed_current_round = true; m.total_contributions += amt; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u), &m); }
     fn get_deposit_record(env: Env, id: u64) -> AnchorDeposit { env.storage().instance().get(&DataKey::K1(symbol_short!("DRec"), id)).unwrap() }
     fn configure_dex_swap(env: Env, adm: Address, cid: u64, cfg: DexSwapConfig) { adm.require_auth(); env.storage().instance().set(&DataKey::K1(symbol_short!("DexC"), cid), &cfg); }
     fn trigger_dex_swap(_env: Env, adm: Address, _cid: u64) { adm.require_auth(); }
@@ -377,10 +391,22 @@ impl SoroSusuTrait for SoroSusu {
     fn initialize_impact_certificate(_env: Env, _grantee: Address, _id: u128, _total: u32, _uri: String) {}
     fn update_milestone_progress(_env: Env, adm: Address, id: u128, new_phase: u32, impact: i128) -> ImpactCertificateMetadata { adm.require_auth(); ImpactCertificateMetadata { id, grantee: adm, total_phases: new_phase + 1, phases_completed: new_phase, impact_score: impact as u32, on_chain_badge: symbol_short!("Impact"), milestone_status: MilestoneProgress::InProgress } }
     fn get_progress_bar_data(env: Env, _id: u128) -> Option<Map<Symbol, String>> { let mut m = Map::new(&env); m.set(symbol_short!("progress"), String::from_str(&env, "50%")); Some(m) }
-    fn set_sanctions_oracle(env: Env, adm: Address, oracle: Address) { adm.require_auth(); env.storage().instance().set(&DataKey::K(symbol_short!("SancO")), &oracle); }
-    fn reveal_next_winner(_env: Env, _cid: u64) -> Address { Address::from_string(&String::from_str(&_env, "GDXC...")) }
-    fn get_frozen_payout(_env: Env, _cid: u64) -> (i128, Option<Address>) { (0, None) }
-    fn review_frozen_payout(_env: Env, adm: Address, _cid: u64, _release: bool) { adm.require_auth(); }
+    fn set_sanctions_oracle(env: Env, adm: Address, oracle: Address) { adm.require_auth(); env.storage().instance().set(&DataKey::K(symbol_short!("Oracle")), &oracle); }
+    fn reveal_next_winner(env: Env, cid: u64) -> Address { let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); c.member_addresses.get(c.current_recipient_index).unwrap() }
+    fn get_frozen_payout(env: Env, cid: u64) -> (i128, Option<Address>) { env.storage().instance().get(&DataKey::K1(symbol_short!("Froze"), cid)).unwrap_or((0, None)) }
+    fn review_frozen_payout(env: Env, adm: Address, cid: u64, release: bool) {
+        adm.require_auth();
+        let frozen_key = DataKey::K1(symbol_short!("Froze"), cid);
+        if let Some((amt, winner_opt)) = env.storage().instance().get::<DataKey, (i128, Option<Address>)>(&frozen_key) {
+            if release {
+                if let Some(winner) = winner_opt {
+                    let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap();
+                    token::Client::new(&env, &c.token).transfer(&env.current_contract_address(), &winner, &amt);
+                }
+            }
+            env.storage().instance().remove(&frozen_key);
+        }
+    }
     fn create_vesting_lien(env: Env, u: Address, cid: u64, vault: Address, amt: i128) -> u64 { u.require_auth(); let id = 1u64; env.storage().instance().set(&DataKey::K2(symbol_short!("Lien"), cid, u.clone()), &LienInfo { member: u, circle_id: cid, vesting_vault_contract: vault, lien_amount: amt, status: LienStatus::Active, create_timestamp: env.ledger().timestamp(), claim_timestamp: None, release_timestamp: None, lien_id: id }); id }
     fn get_vesting_lien(env: Env, u: Address, cid: u64) -> Option<LienInfo> { env.storage().instance().get(&DataKey::K2(symbol_short!("Lien"), cid, u)) }
     fn get_circle_liens(env: Env, _cid: u64) -> Vec<LienInfo> { Vec::new(&env) }
