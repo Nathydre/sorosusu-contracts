@@ -310,10 +310,30 @@ impl SoroSusu {
 impl SoroSusuTrait for SoroSusu {
     fn init(env: Env, admin: Address, fee: u32) { admin.require_auth(); env.storage().instance().set(&DataKey::K(symbol_short!("Admin")), &admin); env.storage().instance().set(&DataKey::K(symbol_short!("Fee")), &fee); }
     fn create_circle(env: Env, creator: Address, amt: i128, max: u32, tok: Address, dur: u64, bond: i128) -> u64 { Self::create_circle_logic(env, creator, amt, max, tok, dur, bond) }
-    fn create_basket_circle(_env: Env, creator: Address, _amt: i128, _max: u32, _assets: Vec<Address>, _weights: Vec<u32>, _dur: u64, _ifee: u64, _nft: Address, _arb: Address) -> u64 { creator.require_auth(); 1 }
+    fn create_basket_circle(env: Env, creator: Address, amt: i128, max: u32, assets: Vec<Address>, weights: Vec<u32>, dur: u64, _ifee: u64, _nft: Address, _arb: Address) -> u64 {
+        let id = Self::create_circle_logic(env.clone(), creator, amt, max, assets.get(0).unwrap(), dur, 0);
+        let mut bsk = Vec::new(&env);
+        for i in 0..assets.len() {
+            bsk.push_back(AssetWeight { token: assets.get(i).unwrap(), weight_bps: weights.get(i).unwrap() });
+        }
+        env.storage().instance().set(&DataKey::K1(symbol_short!("Bsk"), id), &bsk);
+        id
+    }
     fn join_circle(env: Env, u: Address, cid: u64) { u.require_auth(); let mut c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); if c.member_count >= c.max_members { panic!("Circle full"); } c.member_count += 1; c.member_addresses.push_back(u.clone()); env.storage().instance().set(&DataKey::K1(symbol_short!("C"), cid), &c); env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u.clone()), &Member { address: u.clone(), index: c.member_count - 1, contribution_count: 0, last_contribution_time: 0, status: MemberStatus::Active, tier_multiplier: 1, referrer: None, buddy: None, has_contributed_current_round: false, total_contributions: 0 }); env.storage().instance().set(&DataKey::K1A(symbol_short!("Mem"), u.clone()), &Member { address: u, index: 0, contribution_count: 0, last_contribution_time: 0, status: MemberStatus::Active, tier_multiplier: 1, referrer: None, buddy: None, has_contributed_current_round: false, total_contributions: 0 }); }
-    fn deposit(env: Env, u: Address, cid: u64, _r: u32) { u.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); token::Client::new(&env, &c.token).transfer(&u, &env.current_contract_address(), &c.contribution_amount); m.contribution_count += 1; m.total_contributions += c.contribution_amount; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u), &m); }
-    fn deposit_basket(_env: Env, u: Address, _cid: u64) { u.require_auth(); }
+    fn deposit(env: Env, u: Address, cid: u64, _r: u32) { u.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); token::Client::new(&env, &c.token).transfer(&u, &env.current_contract_address(), &c.contribution_amount); m.contribution_count += 1; m.total_contributions += c.contribution_amount; m.has_contributed_current_round = true; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u.clone()), &m); env.storage().instance().set(&DataKey::K1A(symbol_short!("Mem"), u), &m); }
+    fn deposit_basket(env: Env, u: Address, cid: u64) {
+        u.require_auth();
+        let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap();
+        let bsk: Vec<AssetWeight> = env.storage().instance().get(&DataKey::K1(symbol_short!("Bsk"), cid)).unwrap();
+        for aw in bsk.iter() {
+            let amt = (c.contribution_amount * (aw.weight_bps as i128)) / 10000;
+            token::Client::new(&env, &aw.token).transfer(&u, &env.current_contract_address(), &amt);
+        }
+        let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap();
+        m.contribution_count += 1; m.has_contributed_current_round = true;
+        env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u.clone()), &m);
+        env.storage().instance().set(&DataKey::K1A(symbol_short!("Mem"), u), &m);
+    }
     fn propose_duration(env: Env, u: Address, _cid: u64, dur: u64) -> u64 { u.require_auth(); let id = 1u64; env.storage().instance().set(&DataKey::K1(symbol_short!("PDur"), id), &DurationProposal { id, new_duration: dur, votes_for: 1, votes_against: 0, end_time: env.ledger().timestamp() + 86400, is_active: true }); id }
     fn vote_duration(env: Env, u: Address, _cid: u64, pid: u64, app: bool) { u.require_auth(); let mut p: DurationProposal = env.storage().instance().get(&DataKey::K1(symbol_short!("PDur"), pid)).unwrap(); if app { p.votes_for += 1; } else { p.votes_against += 1; } env.storage().instance().set(&DataKey::K1(symbol_short!("PDur"), pid), &p); }
     fn slash_bond(_env: Env, adm: Address, _cid: u64) { adm.require_auth(); }
@@ -372,7 +392,32 @@ impl SoroSusuTrait for SoroSusu {
     fn get_basket_config(env: Env, cid: u64) -> Vec<AssetWeight> { env.storage().instance().get(&DataKey::K1(symbol_short!("Bsk"), cid)).unwrap() }
     fn register_anchor(env: Env, adm: Address, info: AnchorInfo) { adm.require_auth(); env.storage().instance().set(&DataKey::K1A(symbol_short!("Anch"), info.anchor_address.clone()), &info); }
     fn get_anchor_info(env: Env, a: Address) -> AnchorInfo { env.storage().instance().get(&DataKey::K1A(symbol_short!("Anch"), a)).unwrap() }
-    fn deposit_for_user(env: Env, anc: Address, u: Address, cid: u64, amt: i128, _mem: String, _fiat: String, _sep: String) { anc.require_auth(); let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap(); let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap(); token::Client::new(&env, &c.token).transfer(&anc, &env.current_contract_address(), &amt); m.has_contributed_current_round = true; m.total_contributions += amt; env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u), &m); }
+    fn deposit_for_user(env: Env, anc: Address, u: Address, cid: u64, amt: i128, mem: String, fiat: String, sep: String) {
+        anc.require_auth();
+        let mut m: Member = env.storage().instance().get(&DataKey::K2(symbol_short!("M"), cid, u.clone())).unwrap();
+        let c: CircleInfo = env.storage().instance().get(&DataKey::K1(symbol_short!("C"), cid)).unwrap();
+        token::Client::new(&env, &c.token).transfer(&anc, &env.current_contract_address(), &amt);
+        m.has_contributed_current_round = true;
+        m.total_contributions += amt;
+        env.storage().instance().set(&DataKey::K2(symbol_short!("M"), cid, u.clone()), &m);
+        env.storage().instance().set(&DataKey::K1A(symbol_short!("Mem"), u.clone()), &m);
+
+        let id = 1u64;
+        let record = AnchorDeposit {
+            id,
+            anchor_address: anc,
+            beneficiary_user: u,
+            circle_id: cid,
+            amount: amt,
+            deposit_memo: mem,
+            fiat_reference: fiat,
+            sep_type: sep,
+            timestamp: env.ledger().timestamp(),
+            processed: true,
+            compliance_verified: true,
+        };
+        env.storage().instance().set(&DataKey::K1(symbol_short!("DRec"), id), &record);
+    }
     fn get_deposit_record(env: Env, id: u64) -> AnchorDeposit { env.storage().instance().get(&DataKey::K1(symbol_short!("DRec"), id)).unwrap() }
     fn configure_dex_swap(env: Env, adm: Address, cid: u64, cfg: DexSwapConfig) { adm.require_auth(); env.storage().instance().set(&DataKey::K1(symbol_short!("DexC"), cid), &cfg); }
     fn trigger_dex_swap(_env: Env, adm: Address, _cid: u64) { adm.require_auth(); }
