@@ -46,6 +46,14 @@ pub enum DataKey {
     GroupLeadBond(u64),
     // New: Slashing proposals
     SlashingProposal(u64),
+    // New: Staking collateral for high-value rounds
+    StakedCollateral(u64, Address), // (circle_id, user_address)
+    // New: Vault for collateral storage
+    CollateralVault,
+    // New: Reliability Index for users
+    ReliabilityIndex(Address),
+    // New: User activity tracking for RI calculation
+    UserActivity(Address),
 }
 
 #[contracttype]
@@ -195,6 +203,42 @@ pub struct SlashingProposal {
     pub is_executed: bool,
 }
 
+// New: Collateral stake structure
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StakedCollateral {
+    pub circle_id: u64,
+    pub user: Address,
+    pub amount: i128,
+    pub staked_at: u64,
+    pub is_slashed: bool,
+    pub is_released: bool,
+}
+
+// New: User activity tracking for Reliability Index
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct UserActivity {
+    pub user: Address,
+    pub timely_contributions: u32,
+    pub late_contributions: u32,
+    pub total_cycles_completed: u32,
+    pub total_volume_contributed: i128,
+    pub last_activity_time: u64,
+    pub consecutive_cycles: u32,
+    pub longest_streak: u32,
+}
+
+// New: Reliability Index structure
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ReliabilityIndex {
+    pub user: Address,
+    pub score: u32, // 0-1000
+    pub last_updated: u64,
+    pub decay_rate: u32, // basis points per day of inactivity
+}
+
 // --- CONTRACT TRAIT ---
 
 pub trait SoroSusuTrait {
@@ -259,6 +303,18 @@ pub trait SoroSusuTrait {
     fn create_slashing_proposal(env: Env, circle_id: u64, target_lead: Address, reason: String, proposer: Address) -> u64;
     fn vote_on_slashing(env: Env, voter: Address, proposal_id: u64, vote: bool);
     fn execute_slashing(env: Env, executor: Address, proposal_id: u64);
+    
+    // Staking-Gated Entry for High-Value Rounds (#268)
+    fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128);
+    fn slash_stake(env: Env, admin: Address, circle_id: u64, target_user: Address, reason: String);
+    fn release_collateral(env: Env, admin: Address, circle_id: u64, user: Address);
+    fn get_collateral_status(env: Env, circle_id: u64, user: Address) -> StakedCollateral;
+    
+    // Reliability-Index (RI) Calculation Engine (#266)
+    fn calculate_reliability_index(env: Env, user: Address) -> u32;
+    fn update_user_activity(env: Env, user: Address, circle_id: u64, contribution_amount: i128, is_timely: bool);
+    fn apply_ri_decay(env: Env, user: Address);
+    fn get_reliability_index(env: Env, user: Address) -> ReliabilityIndex;
 }
 
 // --- IMPLEMENTATION ---
@@ -348,7 +404,18 @@ impl SoroSusuTrait for SoroSusu {
             }
         }
 
-        // 6. Create and store the new member
+        // 6. NEW: Check for staking requirement for high-value rounds (>5,000 XLM)
+        if circle.contribution_amount >= 5000_0000000 { // 5,000 XLM (assuming 7 decimals)
+            let collateral_key = DataKey::StakedCollateral(circle_id, user.clone());
+            let collateral: StakedCollateral = env.storage().instance().get(&collateral_key)
+                .unwrap_or_else(|| panic!("Collateral stake required for high-value rounds"));
+            
+            if collateral.is_slashed {
+                panic!("Collateral has been slashed, cannot join circle");
+            }
+        }
+
+        // 7. Create and store the new member
         let new_member = Member {
             address: user.clone(),
             has_contributed: false,
@@ -356,11 +423,11 @@ impl SoroSusuTrait for SoroSusu {
             last_contribution_time: 0,
         };
         
-        // 7. Store the member and update circle count
+        // 8. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
         circle.member_count += 1;
         
-        // 8. Save the updated circle back to storage
+        // 9. Save the updated circle back to storage
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 
@@ -386,8 +453,9 @@ impl SoroSusuTrait for SoroSusu {
         // 5. Check if payment is late and apply penalty if needed
         let current_time = env.ledger().timestamp();
         let mut penalty_amount = 0i128;
+        let is_timely = current_time <= circle.deadline_timestamp;
 
-        if current_time > circle.deadline_timestamp {
+        if !is_timely {
             // Calculate 1% penalty
             penalty_amount = contribution_amount / 100; // 1% penalty
             
@@ -429,7 +497,10 @@ impl SoroSusuTrait for SoroSusu {
         // 11. Mark as Paid in the old format for backward compatibility
         env.storage().instance().set(&DataKey::Deposit(circle_id, user.clone()), &true);
 
-        // 12. Emit contribution event (masked if privacy is enabled)
+        // 12. NEW: Update user activity for reliability index calculation
+        Self::update_user_activity(env.clone(), user.clone(), circle_id, contribution_amount, is_timely);
+
+        // 13. Emit contribution event (masked if privacy is enabled)
         if privacy_masked {
             let event = ContributionMaskedEvent {
                 member_id: user,
@@ -1135,5 +1206,355 @@ impl SoroSusuTrait for SoroSusu {
 
         proposal.is_executed = true;
         env.storage().instance().set(&DataKey::SlashingProposal(proposal_id), &proposal);
+    }
+
+    // Staking-Gated Entry for High-Value Rounds (#268)
+    fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128) {
+        // 1. Authorization: The user must sign this transaction
+        user.require_auth();
+
+        // 2. Verify the circle exists
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+
+        // 3. Check if this is a high-value round
+        if circle.contribution_amount < 5000_0000000 {
+            panic!("Collateral staking only required for high-value rounds (>5,000 XLM)");
+        }
+
+        // 4. Check if user already has collateral staked
+        let collateral_key = DataKey::StakedCollateral(circle_id, user.clone());
+        if env.storage().instance().has(&collateral_key) {
+            panic!("Collateral already staked for this circle");
+        }
+
+        // 5. Calculate minimum collateral requirement (20% of contribution amount)
+        let min_collateral = (circle.contribution_amount * 20) / 100;
+        if amount < min_collateral {
+            panic!("Collateral amount below minimum requirement");
+        }
+
+        // 6. Create collateral stake record
+        let current_time = env.ledger().timestamp();
+        let collateral = StakedCollateral {
+            circle_id,
+            user: user.clone(),
+            amount,
+            staked_at: current_time,
+            is_slashed: false,
+            is_released: false,
+        };
+
+        // 7. Transfer collateral to vault
+        let client = token::Client::new(&env, &circle.token);
+        client.transfer(&user, &env.current_contract_address(), &amount);
+
+        // 8. Update collateral vault balance
+        let mut vault_balance: i128 = env.storage().instance().get(&DataKey::CollateralVault).unwrap_or(0);
+        vault_balance += amount;
+        env.storage().instance().set(&DataKey::CollateralVault, &vault_balance);
+
+        // 9. Store collateral stake
+        env.storage().instance().set(&collateral_key, &collateral);
+
+        // 10. Emit staking event
+        env.events().publish((Symbol::new(&env, "collateral_staked"),), (circle_id, user, amount));
+    }
+
+    fn slash_stake(env: Env, admin: Address, circle_id: u64, target_user: Address, reason: String) {
+        // 1. Authorization: The admin must sign this transaction
+        admin.require_auth();
+
+        // 2. Verify the caller is the admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("No admin set"));
+        
+        if stored_admin != admin {
+            panic!("Caller is not the admin");
+        }
+
+        // 3. Get the collateral stake
+        let collateral_key = DataKey::StakedCollateral(circle_id, target_user.clone());
+        let mut collateral: StakedCollateral = env.storage().instance().get(&collateral_key)
+            .unwrap_or_else(|| panic!("No collateral found for this user"));
+
+        // 4. Check if collateral is already slashed or released
+        if collateral.is_slashed {
+            panic!("Collateral already slashed");
+        }
+        if collateral.is_released {
+            panic!("Collateral already released");
+        }
+
+        // 5. Mark collateral as slashed
+        collateral.is_slashed = true;
+        env.storage().instance().set(&collateral_key, &collateral);
+
+        // 6. Update vault balance (remove slashed amount)
+        let mut vault_balance: i128 = env.storage().instance().get(&DataKey::CollateralVault).unwrap_or(0);
+        vault_balance -= collateral.amount;
+        env.storage().instance().set(&DataKey::CollateralVault, &vault_balance);
+
+        // 7. Transfer slashed collateral to group reserve for victim compensation
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+        
+        let client = token::Client::new(&env, &circle.token);
+        client.transfer(&env.current_contract_address(), &env.current_contract_address(), &collateral.amount);
+
+        // 8. Update group reserve
+        let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        reserve_balance += collateral.amount as u64;
+        env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
+
+        // 9. Emit slashing event
+        env.events().publish((Symbol::new(&env, "collateral_slashed"),), (circle_id, target_user, collateral.amount, reason));
+    }
+
+    fn release_collateral(env: Env, admin: Address, circle_id: u64, user: Address) {
+        // 1. Authorization: The admin must sign this transaction
+        admin.require_auth();
+
+        // 2. Verify the caller is the admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("No admin set"));
+        
+        if stored_admin != admin {
+            panic!("Caller is not the admin");
+        }
+
+        // 3. Get the collateral stake
+        let collateral_key = DataKey::StakedCollateral(circle_id, user.clone());
+        let mut collateral: StakedCollateral = env.storage().instance().get(&collateral_key)
+            .unwrap_or_else(|| panic!("No collateral found for this user"));
+
+        // 4. Check if collateral is already released or slashed
+        if collateral.is_released {
+            panic!("Collateral already released");
+        }
+        if collateral.is_slashed {
+            panic!("Cannot release slashed collateral");
+        }
+
+        // 5. Mark collateral as released
+        collateral.is_released = true;
+        env.storage().instance().set(&collateral_key, &collateral);
+
+        // 6. Update vault balance
+        let mut vault_balance: i128 = env.storage().instance().get(&DataKey::CollateralVault).unwrap_or(0);
+        vault_balance -= collateral.amount;
+        env.storage().instance().set(&DataKey::CollateralVault, &vault_balance);
+
+        // 7. Transfer collateral back to user
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
+            .unwrap_or_else(|| panic!("Circle does not exist"));
+        
+        let client = token::Client::new(&env, &circle.token);
+        client.transfer(&env.current_contract_address(), &user, &collateral.amount);
+
+        // 8. Emit release event
+        env.events().publish((Symbol::new(&env, "collateral_released"),), (circle_id, user, collateral.amount));
+    }
+
+    fn get_collateral_status(env: Env, circle_id: u64, user: Address) -> StakedCollateral {
+        let collateral_key = DataKey::StakedCollateral(circle_id, user);
+        env.storage().instance().get(&collateral_key)
+            .unwrap_or_else(|| panic!("No collateral found for this user"))
+    }
+
+    // Reliability-Index (RI) Calculation Engine (#266)
+    fn calculate_reliability_index(env: Env, user: Address) -> u32 {
+        // 1. Get user activity data
+        let activity_key = DataKey::UserActivity(user.clone());
+        let activity: UserActivity = env.storage().instance().get(&activity_key)
+            .unwrap_or_else(|| UserActivity {
+                user: user.clone(),
+                timely_contributions: 0,
+                late_contributions: 0,
+                total_cycles_completed: 0,
+                total_volume_contributed: 0,
+                last_activity_time: 0,
+                consecutive_cycles: 0,
+                longest_streak: 0,
+            });
+
+        // 2. Calculate timeliness score (40% weight)
+        let total_contributions = activity.timely_contributions + activity.late_contributions;
+        let timeliness_score = if total_contributions > 0 {
+            (activity.timely_contributions * 400) / total_contributions
+        } else {
+            0
+        };
+
+        // 3. Calculate volume score (30% weight) - based on total volume contributed
+        let volume_score = {
+            let volume_factor = activity.total_volume_contributed / 1000_0000000; // Convert to XLM units
+            if volume_factor > 1000 {
+                300 // Max volume score
+            } else {
+                ((volume_factor * 300) / 1000) as u32
+            }
+        };
+
+        // 4. Calculate frequency score (20% weight) - based on cycles completed and streak
+        let frequency_score = {
+            let cycles_score = if activity.total_cycles_completed > 50 {
+                100 // Max cycles score
+            } else {
+                (activity.total_cycles_completed * 2) // 2 points per cycle
+            };
+            let streak_score = if activity.longest_streak > 20 {
+                100 // Max streak score
+            } else {
+                activity.longest_streak * 5 // 5 points per streak
+            };
+            (cycles_score + streak_score).min(200)
+        };
+
+        // 5. Calculate consistency score (10% weight) - based on consecutive cycles
+        let consistency_score = if activity.consecutive_cycles > 10 {
+            100 // Max consistency score
+        } else {
+            activity.consecutive_cycles * 10 // 10 points per consecutive cycle
+        };
+
+        // 6. Combine all scores
+        let base_score = timeliness_score + volume_score + frequency_score + consistency_score;
+        
+        // 7. Apply decay for inactivity
+        let current_time = env.ledger().timestamp();
+        let days_inactive = if activity.last_activity_time > 0 {
+            (current_time - activity.last_activity_time) / (24 * 3600) // Convert to days
+        } else {
+            0
+        };
+        
+        let decay_amount = if days_inactive > 30 {
+            // Start decay after 30 days of inactivity
+            let extra_days = days_inactive - 30;
+            (extra_days * 5) // 5 points per day of inactivity
+        } else {
+            0
+        };
+
+        // 8. Final score calculation
+        let final_score = if base_score > decay_amount as u32 {
+            base_score - decay_amount as u32
+        } else {
+            0
+        }.min(1000); // Cap at 1000
+
+        // 9. Store the updated reliability index
+        let ri = ReliabilityIndex {
+            user: user.clone(),
+            score: final_score,
+            last_updated: current_time,
+            decay_rate: 5, // 5 basis points per day
+        };
+        env.storage().instance().set(&DataKey::ReliabilityIndex(user), &ri);
+
+        final_score
+    }
+
+    fn update_user_activity(env: Env, user: Address, _circle_id: u64, contribution_amount: i128, is_timely: bool) {
+        // 1. Get existing activity or create new
+        let activity_key = DataKey::UserActivity(user.clone());
+        let mut activity: UserActivity = env.storage().instance().get(&activity_key)
+            .unwrap_or_else(|| UserActivity {
+                user: user.clone(),
+                timely_contributions: 0,
+                late_contributions: 0,
+                total_cycles_completed: 0,
+                total_volume_contributed: 0,
+                last_activity_time: 0,
+                consecutive_cycles: 0,
+                longest_streak: 0,
+            });
+
+        // 2. Update contribution tracking
+        if is_timely {
+            activity.timely_contributions += 1;
+        } else {
+            activity.late_contributions += 1;
+        }
+
+        // 3. Update volume tracking
+        activity.total_volume_contributed += contribution_amount;
+
+        // 4. Update cycles completed
+        activity.total_cycles_completed += 1;
+
+        // 5. Update consecutive cycles and streak
+        let current_time = env.ledger().timestamp();
+        let one_day = 24 * 3600;
+        
+        if activity.last_activity_time > 0 && (current_time - activity.last_activity_time) <= (one_day * 7) {
+            // If last activity was within 7 days, continue streak
+            activity.consecutive_cycles += 1;
+            if activity.consecutive_cycles > activity.longest_streak {
+                activity.longest_streak = activity.consecutive_cycles;
+            }
+        } else {
+            // Reset consecutive cycles
+            activity.consecutive_cycles = 1;
+        }
+
+        // 6. Update last activity time
+        activity.last_activity_time = current_time;
+
+        // 7. Store updated activity
+        env.storage().instance().set(&activity_key, &activity);
+
+        // 8. Trigger reliability index recalculation
+        Self::calculate_reliability_index(env, user);
+    }
+
+    fn apply_ri_decay(env: Env, user: Address) {
+        // 1. Get current reliability index
+        let ri_key = DataKey::ReliabilityIndex(user.clone());
+        let mut ri: ReliabilityIndex = env.storage().instance().get(&ri_key)
+            .unwrap_or_else(|| ReliabilityIndex {
+                user: user.clone(),
+                score: 0,
+                last_updated: 0,
+                decay_rate: 5,
+            });
+
+        // 2. Calculate days since last update
+        let current_time = env.ledger().timestamp();
+        let days_since_update = if ri.last_updated > 0 {
+            (current_time - ri.last_updated) / (24 * 3600)
+        } else {
+            0
+        };
+
+        // 3. Apply decay if inactive for more than 30 days
+        if days_since_update > 30 {
+            let inactive_days = days_since_update - 30;
+            let decay_amount = (inactive_days * ri.decay_rate as u64) as u32;
+            
+            if ri.score > decay_amount {
+                ri.score -= decay_amount;
+            } else {
+                ri.score = 0;
+            }
+        }
+
+        // 4. Update last updated time
+        ri.last_updated = current_time;
+
+        // 5. Store updated reliability index
+        env.storage().instance().set(&ri_key, &ri);
+    }
+
+    fn get_reliability_index(env: Env, user: Address) -> ReliabilityIndex {
+        let ri_key = DataKey::ReliabilityIndex(user.clone());
+        env.storage().instance().get(&ri_key)
+            .unwrap_or_else(|| ReliabilityIndex {
+                user,
+                score: 0,
+                last_updated: 0,
+                decay_rate: 5,
+            })
     }
 }
