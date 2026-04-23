@@ -45,6 +45,8 @@ pub enum Error {
     InvalidProposalType = 33,
     QuorumNotMet = 34,
     ProposalExpired = 35,
+    AppealNotFound = 36,
+    AppealAlreadyFinalized = 37,
 }
 
 // --- CONSTANTS ---
@@ -61,6 +63,10 @@ const MAX_VOTE_WEIGHT: u32 = 100; // Maximum quadratic vote weight
 const MIN_GROUP_SIZE_FOR_QUADRATIC: u32 = 10; // Enable quadratic voting for groups >= 10 members
 const DEFAULT_COLLATERAL_BPS: u32 = 2000; // 20%
 const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_0; // 1000 XLM (assuming 7 decimals)
+const REPUTATION_AMNESTY_THRESHOLD: u32 = 66; // 66% for 2/3 majority
+const MAX_RI: u32 = 1000;
+const RI_PENALTY: u32 = 200;
+const RI_RESTORE: u32 = 200;
 
 // --- DATA STRUCTURES ---
 
@@ -88,6 +94,9 @@ pub enum DataKey {
     QuadraticVote(u64, Address),
     VotingPower(Address, u64),
     ProposalStats(u64),
+    ReliabilityIndex(Address),
+    ReputationAppeal(u64, Address),
+    AppealVotes(u64, Address, Address),
 }
 
 #[contracttype]
@@ -144,6 +153,14 @@ pub enum QuadraticVoteChoice {
     For,
     Against,
     Abstain,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppealStatus {
+    Pending,
+    Approved,
+    Rejected,
 }
 
 #[contracttype]
@@ -211,6 +228,28 @@ pub struct ProposalStats {
     pub executed_proposals: u32,
     pub average_participation: u32,
     pub average_voting_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReliabilityIndex {
+    pub points: u16,           // 0-1000 points
+    pub successful_cycles: u16,
+    pub default_count: u8,
+    pub last_update: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationAppeal {
+    pub requester: Address,
+    pub circle_id: u64,
+    pub appeal_timestamp: u64,
+    pub voting_deadline: u64,
+    pub status: AppealStatus,
+    pub for_votes: u32,
+    pub against_votes: u32,
+    pub reason: String,
 }
 
 #[contracttype]
@@ -362,6 +401,12 @@ pub trait SoroSusuTrait {
     fn slash_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn release_collateral(env: Env, caller: Address, circle_id: u64, member: Address);
     fn mark_member_defaulted(env: Env, caller: Address, circle_id: u64, member: Address);
+
+    // Reputation Appeal functions
+    fn appeal_penalty(env: Env, requester: Address, circle_id: u64, reason: String);
+    fn vote_on_appeal(env: Env, voter: Address, circle_id: u64, requester: Address, approve: bool);
+    fn reputation_amnesty(env: Env, caller: Address, circle_id: u64, requester: Address);
+    fn get_reliability_index(env: Env, member: Address) -> ReliabilityIndex;
 }
 
 // --- IMPLEMENTATION ---
@@ -623,11 +668,18 @@ impl SoroSusuTrait for SoroSusu {
         let token_client = token::Client::new(&env, &circle.token);
         token_client.transfer(&env.current_contract_address(), &user, &pot_amount);
 
-        // Auto-release collateral if member has completed all contributions
-        if circle.requires_collateral {
-            let member_key = DataKey::Member(user.clone());
-            if let Some(member_info) = env.storage().instance().get::<DataKey, Member>(&member_key) {
-                if member_info.contribution_count >= circle.max_members {
+        // Auto-release collateral and reward RI if member has completed all contributions
+        let member_key = DataKey::Member(user.clone());
+        if let Some(member_info) = env.storage().instance().get::<DataKey, Member>(&member_key) {
+            if member_info.contribution_count >= circle.max_members {
+                // Reward RI
+                let mut ri = Self::get_ri_internal(&env, &user);
+                ri.successful_cycles = ri.successful_cycles.saturating_add(1);
+                ri.points = (ri.points + 50).min(MAX_RI as u16); // +50 points for success
+                ri.last_update = env.ledger().timestamp();
+                Self::update_ri_internal(&env, &user, ri);
+
+                if circle.requires_collateral {
                     let collateral_key = DataKey::CollateralVault(user.clone(), circle_id);
                     if let Some(mut collateral_info) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
                         if collateral_info.status == CollateralStatus::Staked {
@@ -1232,11 +1284,14 @@ impl SoroSusuTrait for SoroSusu {
         // We use integer approximation: sqrt(x) ≈ x / (sqrt(x) + 1) for simplicity
         // In production, you'd use a proper sqrt implementation
         
+        let ri = Self::get_ri_internal(&env, &member);
+        
         let quadratic_power = if token_balance > 0 {
-            // Simple approximation of square root for demonstration
-            // In practice, you'd use a more accurate method
-            let balance_u64 = token_balance as u64;
-            (balance_u64 / 1000).max(1) // Simplified calculation
+            // Formula: Tokens * (RI / 1000)
+            // Use large enough intermediate values to avoid precision loss
+            let weighted_balance = (token_balance * ri.points as i128) / 1000;
+            let balance_u64 = weighted_balance as u64;
+            (balance_u64 / 1000).max(1)
         } else {
             0
         };
@@ -1250,6 +1305,31 @@ impl SoroSusuTrait for SoroSusu {
         };
 
         env.storage().instance().set(&DataKey::VotingPower(member, circle_id), &voting_power);
+    }
+
+    fn get_reliability_index(env: Env, member: Address) -> ReliabilityIndex {
+        Self::get_ri_internal(&env, &member)
+    }
+
+    // Helper functions for internal RI management
+    fn get_ri_internal(env: &Env, member: &Address) -> ReliabilityIndex {
+        env.storage().instance().get(&DataKey::ReliabilityIndex(member.clone())).unwrap_or(ReliabilityIndex {
+            points: MAX_RI as u16,
+            successful_cycles: 0,
+            default_count: 0,
+            last_update: env.ledger().timestamp(),
+        })
+    }
+
+    fn update_ri_internal(env: &Env, member: &Address, ri: ReliabilityIndex) {
+        env.storage().instance().set(&DataKey::ReliabilityIndex(member.clone()), &ri);
+    }
+
+    fn report_to_external_registries(env: &Env, member: &Address, event_type: Symbol, amount: i128) {
+        // Emit event for external identity protocols to pick up
+        env.events().publish((symbol_short!("EXT_REP"), member.clone()), (event_type, amount));
+    }
+
     fn stake_collateral(env: Env, user: Address, circle_id: u64, amount: i128) {
         user.require_auth();
         
@@ -1394,6 +1474,17 @@ impl SoroSusuTrait for SoroSusu {
         member_info.status = MemberStatus::Defaulted;
         env.storage().instance().set(&member_key, &member_info);
 
+        // Apply RI Penalty
+        let mut ri = Self::get_ri_internal(&env, &member);
+        ri.points = ri.points.saturating_sub(RI_PENALTY);
+        ri.default_count += 1;
+        ri.last_update = env.ledger().timestamp();
+        Self::update_ri_internal(&env, &member, ri);
+
+        // Report to external registries (Negative-Credit Reporting)
+        let amount_stolen = circle.contribution_amount * (circle.member_count as i128); // Pot value
+        Self::report_to_external_registries(&env, &member, symbol_short!("DEFAULT"), amount_stolen);
+
         // Add to defaulted members list
         let defaulted_key = DataKey::DefaultedMembers(circle_id);
         let mut defaulted_members: Vec<Address> = env.storage().instance().get(&defaulted_key).unwrap_or(Vec::new(&env));
@@ -1408,6 +1499,122 @@ impl SoroSusuTrait for SoroSusu {
         if let Some(_collateral) = env.storage().instance().get::<DataKey, CollateralInfo>(&collateral_key) {
             // Reuse slash_collateral logic
             Self::slash_collateral(env, caller, circle_id, member);
+        }
+    }
+
+    fn appeal_penalty(env: Env, requester: Address, circle_id: u64, reason: String) {
+        requester.require_auth();
+
+        // Check if member is defaulted
+        let member_key = DataKey::Member(requester.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+        if member_info.status != MemberStatus::Defaulted {
+            panic!("Only defaulted members can appeal");
+        }
+
+        let appeal_key = DataKey::ReputationAppeal(circle_id, requester.clone());
+        if env.storage().instance().has(&appeal_key) {
+            panic!("Appeal already exists");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let voting_deadline = current_time + VOTING_PERIOD;
+
+        let appeal = ReputationAppeal {
+            requester,
+            circle_id,
+            appeal_timestamp: current_time,
+            voting_deadline,
+            status: AppealStatus::Pending,
+            for_votes: 0,
+            against_votes: 0,
+            reason,
+        };
+
+        env.storage().instance().set(&appeal_key, &appeal);
+    }
+
+    fn vote_on_appeal(env: Env, voter: Address, circle_id: u64, requester: Address, approve: bool) {
+        voter.require_auth();
+
+        let appeal_key = DataKey::ReputationAppeal(circle_id, requester.clone());
+        let mut appeal: ReputationAppeal = env.storage().instance().get(&appeal_key).expect("Appeal not found");
+
+        if appeal.status != AppealStatus::Pending {
+            panic!("Appeal already finalized");
+        }
+
+        if env.ledger().timestamp() > appeal.voting_deadline {
+            panic!("Voting period expired");
+        }
+
+        let vote_key = DataKey::AppealVotes(circle_id, requester.clone(), voter.clone());
+        if env.storage().temporary().has(&vote_key) {
+            panic!("Already voted");
+        }
+
+        // Must be a member of the same circle
+        // (Simplified check: assume voter is a member if they can be found)
+        let voter_key = DataKey::Member(voter.clone());
+        let _voter_info: Member = env.storage().instance().get(&voter_key).expect("Voter not found");
+
+        if approve {
+            appeal.for_votes += 1;
+        } else {
+            appeal.against_votes += 1;
+        }
+
+        // Use temporary storage for votes to save on ledger rent for data that is only needed during voting
+        env.storage().temporary().set(&vote_key, &approve);
+        env.storage().instance().set(&appeal_key, &appeal);
+
+        // Check for 2/3 majority
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).expect("Circle not found");
+        let total_voters = circle.member_count - 1; // Exclude requester
+        let required_votes = (total_voters * REPUTATION_AMNESTY_THRESHOLD) / 100;
+
+        if appeal.for_votes >= required_votes {
+            appeal.status = AppealStatus::Approved;
+            env.storage().instance().set(&appeal_key, &appeal);
+            // Amnesty is auto-executed if majority reached
+            Self::reputation_amnesty(env, voter, circle_id, requester);
+        } else if appeal.against_votes > (total_voters - required_votes) {
+            appeal.status = AppealStatus::Rejected;
+            env.storage().instance().set(&appeal_key, &appeal);
+        }
+    }
+
+    fn reputation_amnesty(env: Env, caller: Address, circle_id: u64, requester: Address) {
+        caller.require_auth();
+
+        let appeal_key = DataKey::ReputationAppeal(circle_id, requester.clone());
+        let appeal: ReputationAppeal = env.storage().instance().get(&appeal_key).expect("Appeal not found");
+
+        if appeal.status != AppealStatus::Approved {
+            panic!("Appeal not approved");
+        }
+
+        // Restore points
+        let mut ri = Self::get_ri_internal(&env, &requester);
+        ri.points = (ri.points + RI_RESTORE).min(MAX_RI);
+        Self::update_ri_internal(&env, &requester, ri);
+
+        // Mark member as active again
+        let member_key = DataKey::Member(requester.clone());
+        let mut member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
+        member_info.status = MemberStatus::Active;
+        env.storage().instance().set(&member_key, &member_info);
+
+        // Remove from defaulted list
+        let defaulted_key = DataKey::DefaultedMembers(circle_id);
+        if let Some(mut defaulted_members) = env.storage().instance().get::<DataKey, Vec<Address>>(&defaulted_key) {
+            let mut new_list = Vec::new(&env);
+            for m in defaulted_members.iter() {
+                if m != requester {
+                    new_list.push_back(m);
+                }
+            }
+            env.storage().instance().set(&defaulted_key, &new_list);
         }
     }
 }
