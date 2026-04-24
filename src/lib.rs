@@ -1,5 +1,8 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, token, panic, Map, Vec, i128, u64, u32};
 
+mod yield_oracle_circuit_breaker;
+use yield_oracle_circuit_breaker::{YieldOracleCircuitBreaker, CircuitBreakerState, HealthMetrics};
+
 // --- DATA STRUCTURES ---
 
 #[derive(Clone)]
@@ -1002,6 +1005,17 @@ pub trait SoroSusuTrait {
     fn execute_path_payment(env: Env, user: Address, circle_id: u64, source_token: Address, source_amount: i128);
     fn register_supported_token(env: Env, user: Address, token_address: Address, token_symbol: String, decimals: u32, is_stable: bool);
     fn register_dex(env: Env, user: Address, dex_address: Address, dex_name: String, is_trusted: bool);
+
+    // Yield Oracle Circuit Breaker
+    fn initialize_circuit_breaker(env: Env, admin: Address, protected_vault: Address);
+    fn update_circuit_breaker_config(env: Env, admin: Address, config: yield_oracle_circuit_breaker::CircuitBreakerConfig);
+    fn register_amm_for_monitoring(env: Env, admin: Address, amm_address: Address, initial_metrics: HealthMetrics);
+    fn update_amm_health_metrics(env: Env, amm_address: Address, metrics: HealthMetrics);
+    fn manual_trigger_circuit_breaker(env: Env, admin: Address, reason: String);
+    fn emergency_unwind(env: Env, circle_id: u64, amm_address: Address) -> Result<(), yield_oracle_circuit_breaker::CircuitBreakerError>;
+    fn get_circuit_breaker_status(env: Env) -> CircuitBreakerState;
+    fn get_amm_health_metrics(env: Env, amm_address: Address) -> HealthMetrics;
+    fn reset_circuit_breaker(env: Env, admin: Address);
 
     // Inter-contract reputation query interface
     fn get_reputation(env: Env, user: Address) -> ReputationData;
@@ -3600,6 +3614,13 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn execute_yield_delegation(env: Env, circle_id: u64) {
+        // Check circuit breaker status before executing delegation
+        let circuit_breaker_status = YieldOracleCircuitBreaker::get_circuit_breaker_status(&env);
+        if circuit_breaker_status.status == yield_oracle_circuit_breaker::CircuitBreakerStatus::Triggered ||
+           circuit_breaker_status.status == yield_oracle_circuit_breaker::CircuitBreakerStatus::EmergencyUnwind {
+            panic!("Cannot execute yield delegation - circuit breaker is active");
+        }
+
         let delegation_key = DataKey::YieldDelegation(circle_id);
         let mut delegation: YieldDelegation = env.storage().instance().get(&delegation_key)
             .expect("No yield delegation found");
@@ -3609,6 +3630,20 @@ impl SoroSusuTrait for SoroSusu {
         }
 
         execute_yield_delegation_internal(&env, circle_id, &mut delegation);
+        
+        // Register the AMM for circuit breaker monitoring
+        let initial_metrics = HealthMetrics {
+            current_apy: 500, // Default 5% APY
+            volatility_index: 1000, // Default 10% volatility
+            liquidity_ratio: 8000, // Default 80% liquidity
+            price_impact_score: 500, // Default 5% price impact
+            yield_rate: 500, // Positive yield rate
+            last_updated: env.ledger().timestamp(),
+            is_healthy: true,
+        };
+        
+        YieldOracleCircuitBreaker::register_amm(&env, env.current_contract_address(), delegation.pool_address.clone(), initial_metrics);
+        
         env.storage().instance().set(&delegation_key, &delegation);
 
         env.events().publish(
@@ -4073,6 +4108,44 @@ impl SoroSusuTrait for SoroSusu {
             (Symbol::new(&env, "DEX_REGISTERED"), dex_address),
             (dex_name, is_trusted),
         );
+    }
+
+    // --- YIELD ORACLE CIRCUIT BREAKER IMPLEMENTATION ---
+
+    fn initialize_circuit_breaker(env: Env, admin: Address, protected_vault: Address) {
+        YieldOracleCircuitBreaker::initialize(env, admin, protected_vault);
+    }
+
+    fn update_circuit_breaker_config(env: Env, admin: Address, config: yield_oracle_circuit_breaker::CircuitBreakerConfig) {
+        YieldOracleCircuitBreaker::update_config(env, admin, config);
+    }
+
+    fn register_amm_for_monitoring(env: Env, admin: Address, amm_address: Address, initial_metrics: HealthMetrics) {
+        YieldOracleCircuitBreaker::register_amm(env, admin, amm_address, initial_metrics);
+    }
+
+    fn update_amm_health_metrics(env: Env, amm_address: Address, metrics: HealthMetrics) {
+        YieldOracleCircuitBreaker::update_health_metrics(env, amm_address, metrics);
+    }
+
+    fn manual_trigger_circuit_breaker(env: Env, admin: Address, reason: String) {
+        YieldOracleCircuitBreaker::manual_trigger_circuit_breaker(env, admin, reason);
+    }
+
+    fn emergency_unwind(env: Env, circle_id: u64, amm_address: Address) -> Result<(), yield_oracle_circuit_breaker::CircuitBreakerError> {
+        YieldOracleCircuitBreaker::emergency_unwind(env, circle_id, amm_address)
+    }
+
+    fn get_circuit_breaker_status(env: Env) -> CircuitBreakerState {
+        YieldOracleCircuitBreaker::get_circuit_breaker_status(env)
+    }
+
+    fn get_amm_health_metrics(env: Env, amm_address: Address) -> HealthMetrics {
+        YieldOracleCircuitBreaker::get_health_metrics(env, amm_address)
+    }
+
+    fn reset_circuit_breaker(env: Env, admin: Address) {
+        YieldOracleCircuitBreaker::reset_circuit_breaker(env, admin);
     }
 
     fn create_basket_circle(
