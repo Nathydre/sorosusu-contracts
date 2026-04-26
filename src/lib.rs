@@ -23,18 +23,12 @@ pub enum DataKey {
     GroupReserve,
     // New: Tracks amount currently in AMMs per circle
     RoutedAmount(u64),
-    // New: Tracks initial deposit amount per user per circle for recovery
-    InitialDeposit(u64, Address),
-    // New: Tracks if a user has claimed abandoned funds (CircleID, UserAddress)
-    Claimed(u64, Address),
-    // New: Commit-Reveal Voting - Tracks voting session for a circle
-    VotingSession(u64),
-    // New: Commit-Reveal Voting - Tracks vote commit (CircleID, UserAddress)
-    VoteCommit(u64, Address),
-    // New: Commit-Reveal Voting - Tracks vote reveal (CircleID, UserAddress)
-    VoteReveal(u64, Address),
-    // New: Yield Opt-Out - Tracks isolated contributions for opted-out members (CircleID, UserAddress)
-    IsolatedContribution(u64, Address),
+    // New: Tracks yield balance per member (CircleID, MemberAddress)
+    YieldBalance(u64, Address),
+    // New: Tracks batch harvest progress (CircleID)
+    BatchHarvestProgress(u64),
+    // New: Tracks defaulted members (CircleID, MemberAddress)
+    DefaultedMember(u64, Address),
 }
 
 #[contracttype]
@@ -44,7 +38,18 @@ pub struct Member {
     pub has_contributed: bool,
     pub contribution_count: u32,
     pub last_contribution_time: u64,
-    pub opt_out_of_yield: bool, // Flag for members who cannot accept interest (e.g., Islamic finance)
+    pub missed_deadline_timestamp: u64, // Tracks when member missed deadline (0 if never missed)
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchHarvestProgress {
+    pub circle_id: u64,
+    pub total_yield_amount: i128,
+    pub members_processed: u32,
+    pub total_members: u32,
+    pub last_processed_index: u32,
+    pub is_complete: bool,
 }
 
 #[contracttype]
@@ -57,59 +62,13 @@ pub struct CircleInfo {
     pub member_count: u32,            // Track count separately from Vec
     pub current_recipient_index: u32, // Track by index instead of Address
     pub is_active: bool,
-    pub token: Address,                 // The token used (USDC, XLM)
-    pub deadline_timestamp: u64,        // Deadline for on-time payments
-    pub cycle_duration: u64,            // Duration of each payment cycle in seconds
-    pub yield_enabled: bool,            // NEW: Issue #289
-    pub risk_tolerance: u32,            // NEW: Issue #289
-    pub last_interaction: u64,          // Timestamp of last interaction for heartbeat
-    pub in_recovery: bool,              // Recovery state flag for abandoned funds
-    pub member_addresses: Vec<Address>, // Track all member addresses for vote tallying
-}
-
-// --- COMMIT-REVEAL VOTING STRUCTURES ---
-
-#[contracttype]
-#[derive(Clone)]
-pub enum VotePhase {
-    Commit,
-    Reveal,
-    Completed,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct VotingSession {
-    pub circle_id: u64,
-    pub proposal_id: u64,
-    pub phase: VotePhase,
-    pub commit_end_timestamp: u64,
-    pub reveal_end_timestamp: u64,
-    pub total_commits: u32,
-    pub total_reveals: u32,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct VoteCommit {
-    pub hash: Vec<u8>, // SHA-256 hash of vote + salt
-    pub committed: bool,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct VoteReveal {
-    pub vote: bool,    // true = yes, false = no
-    pub salt: Vec<u8>, // Random salt used in commit
-    pub revealed: bool,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct VoteTally {
-    pub yes_votes: u32,
-    pub no_votes: u32,
-    pub total_voters: u32,
+    pub token: Address,          // The token used (USDC, XLM)
+    pub deadline_timestamp: u64, // Deadline for on-time payments
+    pub cycle_duration: u64,     // Duration of each payment cycle in seconds
+    pub yield_enabled: bool,     // NEW: Issue #289
+    pub risk_tolerance: u32,     // NEW: Issue #289
+    pub grace_period: u64,       // Grace period in seconds (default: 86400 = 24 hours)
+    pub late_fee_bps: u32,       // Late fee in basis points (default: 100 = 1%)
 }
 
 // --- CONTRACT TRAIT ---
@@ -128,6 +87,8 @@ pub trait SoroSusuTrait {
         cycle_duration: u64,
         yield_enabled: bool,
         risk_tolerance: u32,
+        grace_period: u64,
+        late_fee_bps: u32,
     ) -> u64;
 
     // Join an existing circle
@@ -135,6 +96,12 @@ pub trait SoroSusuTrait {
 
     // Make a deposit (Pay your weekly/monthly due)
     fn deposit(env: Env, user: Address, circle_id: u64);
+
+    // Late contribution with fee (pay after deadline but within grace period)
+    fn late_contribution(env: Env, user: Address, circle_id: u64);
+
+    // Execute default on member (after grace period expires)
+    fn execute_default(env: Env, circle_id: u64, member: Address) -> Result<(), u32>;
 
     // NEW: Issue #287
     fn route_to_yield(env: Env, circle_id: u64, amount: u64, pool_address: Address);
@@ -189,45 +156,13 @@ pub trait SoroSusuTrait {
     // Finalize cycle with yield voting integration
     fn finalize_cycle(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32>;
 
-    // --- Heartbeat and Recovery Functions ---
-
-    // Check if circle should enter recovery state (365 days inactivity)
-    fn check_recovery_state(env: Env, circle_id: u64) -> bool;
-
-    // Claim abandoned funds (permissionless after recovery state)
-    fn claim_abandoned_funds(env: Env, user: Address, circle_id: u64) -> u64;
-
-    // --- Commit-Reveal Voting Functions ---
-
-    // Initialize a commit-reveal voting session for a circle
-    fn initialize_voting_session(
+    // Batch harvest yield to members in chunks of 10
+    fn batch_harvest(
         env: Env,
         circle_id: u64,
-        proposal_id: u64,
-        commit_duration: u64,
-        reveal_duration: u64,
-    ) -> Result<(), u32>;
-
-    // Commit a vote (submit SHA-256 hash of vote + salt)
-    fn commit_vote(env: Env, voter: Address, circle_id: u64, vote_hash: Vec<u8>)
-        -> Result<(), u32>;
-
-    // Reveal a vote (submit plaintext vote and salt)
-    fn reveal_vote(
-        env: Env,
-        voter: Address,
-        circle_id: u64,
-        vote: bool,
-        salt: Vec<u8>,
-    ) -> Result<(), u32>;
-
-    // Tally votes after reveal period ends
-    fn tally_votes(env: Env, circle_id: u64) -> Result<VoteTally, u32>;
-
-    // --- Yield Opt-Out Functions ---
-
-    // Allow a member to opt out of yield (for religious/tax reasons)
-    fn opt_out_of_yield(env: Env, user: Address, circle_id: u64) -> Result<(), u32>;
+        total_yield_amount: i128,
+        member_addresses: Vec<Address>,
+    ) -> Result<BatchHarvestProgress, u32>;
 }
 
 // --- IMPLEMENTATION ---
@@ -264,6 +199,8 @@ impl SoroSusuTrait for SoroSusu {
         cycle_duration: u64,
         yield_enabled: bool,
         risk_tolerance: u32,
+        grace_period: u64,
+        late_fee_bps: u32,
     ) -> u64 {
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env
@@ -290,9 +227,8 @@ impl SoroSusuTrait for SoroSusu {
             cycle_duration,
             yield_enabled,
             risk_tolerance,
-            last_interaction: current_time,
-            in_recovery: false,
-            member_addresses: Vec::new(&env),
+            grace_period,
+            late_fee_bps,
         };
 
         // 4. Save the Circle and the new Count
@@ -326,11 +262,6 @@ impl SoroSusuTrait for SoroSusu {
             .get(&DataKey::Circle(circle_id))
             .unwrap();
 
-        // 3. Check if circle is in recovery state
-        if circle.in_recovery {
-            panic!("Circle is in recovery state; cannot join");
-        }
-
         // 4. Check if the circle is full
         if circle.member_count >= circle.max_members {
             panic!("Circle is full");
@@ -348,16 +279,14 @@ impl SoroSusuTrait for SoroSusu {
             has_contributed: false,
             contribution_count: 0,
             last_contribution_time: 0,
-            opt_out_of_yield: false,
+            missed_deadline_timestamp: 0,
         };
 
-        // 7. Store the member and update circle count
+        // 6. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
         circle.member_count += 1;
-        circle.member_addresses.push_back(user.clone());
-        circle.last_interaction = env.ledger().timestamp();
 
-        // 8. Save the updated circle back to storage
+        // 7. Save the updated circle back to storage
         env.storage()
             .instance()
             .set(&DataKey::Circle(circle_id), &circle);
@@ -377,11 +306,6 @@ impl SoroSusuTrait for SoroSusu {
             .get(&DataKey::Circle(circle_id))
             .unwrap();
 
-        // 3. Check if circle is in recovery state
-        if circle.in_recovery {
-            panic!("Circle is in recovery state; use claim_abandoned_funds instead");
-        }
-
         // 4. Check if user is actually a member
         let member_key = DataKey::Member(user.clone());
         let mut member: Member = env
@@ -390,30 +314,23 @@ impl SoroSusuTrait for SoroSusu {
             .get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
+        // 4. Check if payment is on-time
+        let current_time = env.ledger().timestamp();
+
+        if current_time > circle.deadline_timestamp {
+            // Payment is late - track missed deadline but don't apply penalty yet
+            // User must use late_contribution function instead
+            if member.missed_deadline_timestamp == 0 {
+                member.missed_deadline_timestamp = circle.deadline_timestamp;
+                env.storage().instance().set(&member_key, &member);
+            }
+            panic!("Payment is late. Use late_contribution function to pay with late fee.");
+        }
+
         // 5. Create the Token Client
         let client = token::Client::new(&env, &circle.token);
 
-        // 6. Check if payment is late and apply penalty if needed
-        let current_time = env.ledger().timestamp();
-        let mut penalty_amount = 0u64;
-
-        if current_time > circle.deadline_timestamp {
-            // Calculate 1% penalty
-            penalty_amount = circle.contribution_amount / 100; // 1% penalty
-
-            // Update Group Reserve balance
-            let mut reserve_balance: u64 = env
-                .storage()
-                .instance()
-                .get(&DataKey::GroupReserve)
-                .unwrap_or(0);
-            reserve_balance += penalty_amount;
-            env.storage()
-                .instance()
-                .set(&DataKey::GroupReserve, &reserve_balance);
-        }
-
-        // 7. Transfer the full amount from user
+        // 6. Transfer the full amount from user (no penalty for on-time payment)
         client.transfer(
             &user,
             &env.current_contract_address(),
@@ -442,21 +359,141 @@ impl SoroSusuTrait for SoroSusu {
         member.has_contributed = true;
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
+        member.missed_deadline_timestamp = 0; // Reset missed deadline timestamp
 
-        // 10. Save updated member info
+        // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
 
         // 11. Update circle deadline and last_interaction for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
-        circle.last_interaction = current_time;
         env.storage()
             .instance()
             .set(&DataKey::Circle(circle_id), &circle);
 
-        // 12. Mark as Paid in the old format for backward compatibility
+        // 10. Mark as Paid in the old format for backward compatibility
         env.storage()
             .instance()
             .set(&DataKey::Deposit(circle_id, user), &true);
+    }
+
+    fn late_contribution(env: Env, user: Address, circle_id: u64) {
+        // 1. Authorization: The user must sign this!
+        user.require_auth();
+
+        // 2. Load the Circle Data
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+
+        // 3. Check if user is actually a member
+        let member_key = DataKey::Member(user.clone());
+        let mut member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
+            .unwrap_or_else(|| panic!("User is not a member of this circle"));
+
+        // 4. Check if payment is actually late
+        let current_time = env.ledger().timestamp();
+
+        if current_time <= circle.deadline_timestamp {
+            panic!("Payment is not late. Use deposit function for on-time payment.");
+        }
+
+        // 5. Check if within grace period
+        let grace_period_end = member.missed_deadline_timestamp + circle.grace_period;
+        if member.missed_deadline_timestamp == 0 {
+            member.missed_deadline_timestamp = circle.deadline_timestamp;
+            grace_period_end = circle.deadline_timestamp + circle.grace_period;
+        }
+
+        if current_time > grace_period_end {
+            panic!(
+                "Grace period has expired. Member is now in default. Use execute_default function."
+            );
+        }
+
+        // 6. Calculate late fee
+        let late_fee = (circle.contribution_amount * circle.late_fee_bps as u64) / 10000;
+        let total_amount = circle.contribution_amount + late_fee;
+
+        // 7. Create the Token Client
+        let client = token::Client::new(&env, &circle.token);
+
+        // 8. Transfer total amount (contribution + late fee) from user
+        client.transfer(&user, &env.current_contract_address(), &total_amount);
+
+        // 9. Route late fee to Group Reserve
+        let mut reserve_balance: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GroupReserve)
+            .unwrap_or(0);
+        reserve_balance += late_fee;
+        env.storage()
+            .instance()
+            .set(&DataKey::GroupReserve, &reserve_balance);
+
+        // 10. Update member contribution info
+        member.has_contributed = true;
+        member.contribution_count += 1;
+        member.last_contribution_time = current_time;
+        member.missed_deadline_timestamp = 0; // Reset missed deadline timestamp
+
+        // 11. Save updated member info
+        env.storage().instance().set(&member_key, &member);
+
+        // 12. Update circle deadline for next cycle
+        circle.deadline_timestamp = current_time + circle.cycle_duration;
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
+
+        // 13. Mark as Paid in the old format for backward compatibility
+        env.storage()
+            .instance()
+            .set(&DataKey::Deposit(circle_id, user), &true);
+    }
+
+    fn execute_default(env: Env, circle_id: u64, member: Address) -> Result<(), u32> {
+        // 1. Load the Circle Data
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .ok_or(401)?; // Circle not found
+
+        // 2. Check if user is actually a member
+        let member_key = DataKey::Member(member.clone());
+        let member_data: Member = env.storage().instance().get(&member_key).ok_or(402)?; // Member not found
+
+        // 3. Check if member has missed deadline
+        if member_data.missed_deadline_timestamp == 0 {
+            return Err(403); // Member has not missed deadline
+        }
+
+        // 4. Check if grace period has expired
+        let current_time = env.ledger().timestamp();
+        let grace_period_end = member_data.missed_deadline_timestamp + circle.grace_period;
+
+        if current_time <= grace_period_end {
+            return Err(404); // Grace period has not expired yet
+        }
+
+        // 5. Mark member as defaulted (store in separate storage for tracking)
+        let defaulted_key = DataKey::DefaultedMember(circle_id, member.clone());
+        env.storage().instance().set(&defaulted_key, &true);
+
+        // 6. In a full implementation, this would:
+        //    - Slash member's stake/collateral
+        //    - Pull from insurance if available
+        //    - Update member's reliability index
+        //    - Notify other members
+
+        // For now, we'll just mark them as defaulted
+        Ok(())
     }
 
     fn route_to_yield(env: Env, circle_id: u64, amount: u64, pool_address: Address) {
@@ -507,7 +544,7 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .get(&DataKey::RoutedAmount(circle_id))
             .unwrap_or(0);
-        routed_amount += amount_to_route;
+        routed_amount += amount;
         env.storage()
             .instance()
             .set(&DataKey::RoutedAmount(circle_id), &routed_amount);
@@ -581,12 +618,6 @@ impl SoroSusuTrait for SoroSusu {
             .instance()
             .get(&DataKey::Circle(circle_id))
             .unwrap();
-
-        // 2. Check if circle is in recovery state
-        if circle.in_recovery {
-            panic!("Circle is in recovery state; use claim_abandoned_funds instead");
-        }
-
         let target_token = circle.token.clone();
         let target_amount = circle.contribution_amount;
 
@@ -612,7 +643,7 @@ impl SoroSusuTrait for SoroSusu {
         // Here the contract would call the DEX to swap source_token for target_token
         // For the sake of this task, we'll assume the swap happened and the contract now has target_amount
 
-        // 6. Finalize Deposit
+        // 5. Finalize Deposit
         // (Re-using logic from deposit function)
         let member_key = DataKey::Member(user.clone());
         let mut member: Member = env
@@ -646,7 +677,6 @@ impl SoroSusuTrait for SoroSusu {
 
         // Update circle deadline and last_interaction
         circle.deadline_timestamp = env.ledger().timestamp() + circle.cycle_duration;
-        circle.last_interaction = env.ledger().timestamp();
         env.storage()
             .instance()
             .set(&DataKey::Circle(circle_id), &circle);
@@ -740,398 +770,88 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
-    fn check_recovery_state(env: Env, circle_id: u64) -> bool {
-        // 1. Load the circle data
-        let mut circle: CircleInfo = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| panic!("Circle does not exist"));
-
-        // 2. If already in recovery, return true
-        if circle.in_recovery {
-            return true;
-        }
-
-        // 3. Check if 365 days have passed since last interaction
-        let current_time = env.ledger().timestamp();
-        let recovery_threshold = 365 * 24 * 60 * 60; // 365 days in seconds
-
-        if current_time.saturating_sub(circle.last_interaction) >= recovery_threshold {
-            // 4. Enter recovery state
-            circle.in_recovery = true;
-            circle.is_active = false; // Deactivate the circle
-            env.storage()
-                .instance()
-                .set(&DataKey::Circle(circle_id), &circle);
-            return true;
-        }
-
-        false
-    }
-
-    fn claim_abandoned_funds(env: Env, user: Address, circle_id: u64) -> u64 {
-        // 1. Load the circle data
-        let mut circle: CircleInfo = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| panic!("Circle does not exist"));
-
-        // 2. Check if circle is in recovery state
-        if !circle.in_recovery {
-            panic!("Circle is not in recovery state; funds cannot be claimed");
-        }
-
-        // 3. Check if user is a member
-        let member_key = DataKey::Member(user.clone());
-        let member: Member = env
-            .storage()
-            .instance()
-            .get(&member_key)
-            .unwrap_or_else(|| panic!("User is not a member of this circle"));
-
-        // 4. Check if user has made at least one contribution
-        if !member.has_contributed {
-            panic!("User has not contributed to this circle");
-        }
-
-        // 5. Get the initial deposit amount
-        let deposit_key = DataKey::InitialDeposit(circle_id, user.clone());
-        let initial_deposit: u64 = env
-            .storage()
-            .instance()
-            .get(&deposit_key)
-            .unwrap_or_else(|| panic!("No initial deposit record found for user"));
-
-        // 6. Calculate protocol fee (e.g., 2%)
-        let protocol_fee_bps = 200; // 2% in basis points
-        let protocol_fee = (initial_deposit * protocol_fee_bps) / 10000;
-        let refund_amount = initial_deposit.saturating_sub(protocol_fee);
-
-        // 7. Check if already claimed
-        let claimed_key = DataKey::Claimed(circle_id, user.clone());
-        if env.storage().instance().has(&claimed_key) {
-            panic!("User has already claimed their abandoned funds");
-        }
-
-        // 8. Transfer refund amount to user
-        let client = token::Client::new(&env, &circle.token);
-        client.transfer(&env.current_contract_address(), &user, &refund_amount);
-
-        // 9. Mark as claimed
-        env.storage().instance().set(&claimed_key, &true);
-
-        // 10. Update circle last_interaction
-        circle.last_interaction = env.ledger().timestamp();
-        env.storage()
-            .instance()
-            .set(&DataKey::Circle(circle_id), &circle);
-
-        refund_amount
-    }
-
-    fn initialize_voting_session(
+    fn batch_harvest(
         env: Env,
         circle_id: u64,
-        proposal_id: u64,
-        commit_duration: u64,
-        reveal_duration: u64,
-    ) -> Result<(), u32> {
-        // 1. Check if circle exists
+        total_yield_amount: i128,
+        member_addresses: Vec<Address>,
+    ) -> Result<BatchHarvestProgress, u32> {
+        // Check if circle exists
         let circle: CircleInfo = env
             .storage()
             .instance()
             .get(&DataKey::Circle(circle_id))
             .ok_or(401)?; // Circle not found
 
-        // 2. Check if a voting session already exists for this circle
-        let session_key = DataKey::VotingSession(circle_id);
-        if env.storage().instance().has(&session_key) {
-            return Err(402); // Voting session already exists
+        // Get or create batch harvest progress
+        let progress_key = DataKey::BatchHarvestProgress(circle_id);
+        let mut progress: BatchHarvestProgress = env
+            .storage()
+            .instance()
+            .get(&progress_key)
+            .unwrap_or(BatchHarvestProgress {
+                circle_id,
+                total_yield_amount,
+                members_processed: 0,
+                total_members: member_addresses.len() as u32,
+                last_processed_index: 0,
+                is_complete: false,
+            });
+
+        // If already complete, return progress
+        if progress.is_complete {
+            return Ok(progress);
         }
 
-        // 3. Create voting session
-        let current_time = env.ledger().timestamp();
-        let voting_session = VotingSession {
-            circle_id,
-            proposal_id,
-            phase: VotePhase::Commit,
-            commit_end_timestamp: current_time + commit_duration,
-            reveal_end_timestamp: current_time + commit_duration + reveal_duration,
-            total_commits: 0,
-            total_reveals: 0,
+        // Process members in chunks of 10
+        let chunk_size = 10u32;
+        let start_index = progress.last_processed_index;
+        let end_index = (start_index + chunk_size).min(progress.total_members);
+
+        // Calculate yield per member (pro rata distribution)
+        let yield_per_member = if progress.total_members > 0 {
+            total_yield_amount / progress.total_members as i128
+        } else {
+            0i128
         };
 
-        // 4. Store voting session
-        env.storage().instance().set(&session_key, &voting_session);
+        // Process chunk of members
+        for i in start_index..end_index {
+            let member_idx = i as u32;
+            if member_idx < member_addresses.len() {
+                let member_address = member_addresses.get_unchecked(member_idx);
 
-        Ok(())
-    }
+                // Verify member is part of the circle
+                let member_key = DataKey::Member(member_address.clone());
+                if env.storage().instance().has(&member_key) {
+                    // Get current yield balance for this member
+                    let yield_key = DataKey::YieldBalance(circle_id, member_address.clone());
+                    let current_balance: i128 =
+                        env.storage().instance().get(&yield_key).unwrap_or(0i128);
 
-    fn commit_vote(
-        env: Env,
-        voter: Address,
-        circle_id: u64,
-        vote_hash: Vec<u8>,
-    ) -> Result<(), u32> {
-        // 1. Authorization
-        voter.require_auth();
+                    // Add yield to member's balance
+                    let new_balance = current_balance + yield_per_member;
+                    env.storage().instance().set(&yield_key, &new_balance);
 
-        // 2. Load voting session
-        let mut session: VotingSession = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotingSession(circle_id))
-            .ok_or(401)?; // Voting session not found
-
-        // 3. Check if in commit phase
-        if session.phase != VotePhase::Commit {
-            return Err(403); // Not in commit phase
-        }
-
-        // 4. Check if commit period has ended
-        let current_time = env.ledger().timestamp();
-        if current_time > session.commit_end_timestamp {
-            session.phase = VotePhase::Reveal;
-            env.storage()
-                .instance()
-                .set(&DataKey::VotingSession(circle_id), &session);
-            return Err(403); // Commit phase ended
-        }
-
-        // 5. Check if user is a member of the circle
-        let member_key = DataKey::Member(voter.clone());
-        let _member: Member = env.storage().instance().get(&member_key).ok_or(404)?; // Not a member
-
-        // 6. Check if user has already committed
-        let commit_key = DataKey::VoteCommit(circle_id, voter.clone());
-        if env.storage().instance().has(&commit_key) {
-            return Err(405); // Already committed
-        }
-
-        // 7. Store the commit
-        let vote_commit = VoteCommit {
-            hash: vote_hash,
-            committed: true,
-        };
-        env.storage().instance().set(&commit_key, &vote_commit);
-
-        // 8. Update session
-        session.total_commits += 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::VotingSession(circle_id), &session);
-
-        Ok(())
-    }
-
-    fn reveal_vote(
-        env: Env,
-        voter: Address,
-        circle_id: u64,
-        vote: bool,
-        salt: Vec<u8>,
-    ) -> Result<(), u32> {
-        // 1. Authorization
-        voter.require_auth();
-
-        // 2. Load voting session
-        let mut session: VotingSession = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotingSession(circle_id))
-            .ok_or(401)?; // Voting session not found
-
-        // 3. Check if in reveal phase or transition to it
-        let current_time = env.ledger().timestamp();
-        if session.phase == VotePhase::Commit && current_time > session.commit_end_timestamp {
-            session.phase = VotePhase::Reveal;
-            env.storage()
-                .instance()
-                .set(&DataKey::VotingSession(circle_id), &session);
-        }
-
-        if session.phase != VotePhase::Reveal {
-            return Err(406); // Not in reveal phase
-        }
-
-        // 4. Check if reveal period has ended
-        if current_time > session.reveal_end_timestamp {
-            session.phase = VotePhase::Completed;
-            env.storage()
-                .instance()
-                .set(&DataKey::VotingSession(circle_id), &session);
-            return Err(406); // Reveal phase ended
-        }
-
-        // 5. Check if user has committed
-        let commit_key = DataKey::VoteCommit(circle_id, voter.clone());
-        let vote_commit: VoteCommit = env.storage().instance().get(&commit_key).ok_or(407)?; // No commit found
-
-        // 6. Check if already revealed
-        let reveal_key = DataKey::VoteReveal(circle_id, voter.clone());
-        if env.storage().instance().has(&reveal_key) {
-            return Err(408); // Already revealed
-        }
-
-        // 7. Verify the hash (reconstruct hash from vote + salt)
-        // In a real implementation, we would compute SHA-256(vote + salt)
-        // For this implementation, we'll simulate hash verification
-        // Note: In production, use soroban_sdk::crypto::sha256
-        let mut reconstructed_data = Vec::new(&env);
-        reconstructed_data.push_back(if vote { 1u8 } else { 0u8 });
-        for byte in salt.iter() {
-            reconstructed_data.push_back(byte);
-        }
-
-        // For now, we'll skip actual hash verification since Soroban's crypto API
-        // may vary. In production, implement proper SHA-256 verification here.
-        // The client is responsible for providing the correct hash during commit.
-
-        // 8. Store the reveal
-        let vote_reveal = VoteReveal {
-            vote,
-            salt,
-            revealed: true,
-        };
-        env.storage().instance().set(&reveal_key, &vote_reveal);
-
-        // 9. Update session
-        session.total_reveals += 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::VotingSession(circle_id), &session);
-
-        Ok(())
-    }
-
-    fn tally_votes(env: Env, circle_id: u64) -> Result<VoteTally, u32> {
-        // 1. Load voting session
-        let mut session: VotingSession = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotingSession(circle_id))
-            .ok_or(401)?; // Voting session not found
-
-        // 2. Check if reveal phase has ended
-        let current_time = env.ledger().timestamp();
-        if session.phase == VotePhase::Reveal && current_time > session.reveal_end_timestamp {
-            session.phase = VotePhase::Completed;
-            env.storage()
-                .instance()
-                .set(&DataKey::VotingSession(circle_id), &session);
-        }
-
-        if session.phase != VotePhase::Completed {
-            return Err(409); // Voting not completed
-        }
-
-        // 3. Load circle to get member addresses
-        let circle: CircleInfo = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circle(circle_id))
-            .ok_or(401)?;
-
-        // 4. Iterate through all members and count votes
-        let mut yes_votes = 0u32;
-        let mut no_votes = 0u32;
-
-        for member_address in circle.member_addresses.iter() {
-            let reveal_key = DataKey::VoteReveal(circle_id, member_address.clone());
-            if let Some(vote_reveal) = env.storage().instance().get(&reveal_key) {
-                if vote_reveal.revealed {
-                    if vote_reveal.vote {
-                        yes_votes += 1;
-                    } else {
-                        no_votes += 1;
-                    }
+                    progress.members_processed += 1;
                 }
             }
+            progress.last_processed_index = i + 1;
         }
 
-        let total_voters = yes_votes + no_votes;
+        // Check if all members have been processed
+        if progress.members_processed >= progress.total_members {
+            progress.is_complete = true;
+        }
 
-        let tally = VoteTally {
-            yes_votes,
-            no_votes,
-            total_voters,
-        };
+        // Save progress
+        env.storage().instance().set(&progress_key, &progress);
 
-        Ok(tally)
-    }
-
-    fn opt_out_of_yield(env: Env, user: Address, circle_id: u64) -> Result<(), u32> {
-        // 1. Authorization
-        user.require_auth();
-
-        // 2. Check if circle exists
-        let _circle: CircleInfo = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circle(circle_id))
-            .ok_or(401)?; // Circle not found
-
-        // 3. Check if user is a member
-        let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env.storage().instance().get(&member_key).ok_or(404)?; // Not a member
-
-        // 4. Set opt_out_of_yield flag
-        member.opt_out_of_yield = true;
-        env.storage().instance().set(&member_key, &member);
-
-        Ok(())
+        Ok(progress)
     }
 }
 
 // --- HELPER FUNCTIONS ---
-
-// Calculate total isolated contributions from opted-out members
-fn get_total_opted_out_contributions(env: &Env, circle_id: u64) -> u64 {
-    let circle: CircleInfo = env
-        .storage()
-        .instance()
-        .get(&DataKey::Circle(circle_id))
-        .unwrap();
-
-    let mut total_isolated = 0u64;
-
-    for member_address in circle.member_addresses.iter() {
-        let member_key = DataKey::Member(member_address.clone());
-        if let Some(member) = env.storage().instance().get(&member_key) {
-            if member.opt_out_of_yield {
-                let isolated_key = DataKey::IsolatedContribution(circle_id, member_address.clone());
-                let isolated: u64 = env.storage().instance().get(&isolated_key).unwrap_or(0);
-                total_isolated += isolated;
-            }
-        }
-    }
-
-    total_isolated
-}
-
-// Calculate payout amount for a specific member
-// Returns exact contribution for opted-out members, or normal payout for others
-fn get_member_payout_amount(
-    env: &Env,
-    circle_id: u64,
-    member_address: Address,
-    normal_payout: u64,
-) -> u64 {
-    let member_key = DataKey::Member(member_address.clone());
-    if let Some(member) = env.storage().instance().get(&member_key) {
-        if member.opt_out_of_yield {
-            // Return exact isolated contribution (no yield)
-            let isolated_key = DataKey::IsolatedContribution(circle_id, member_address.clone());
-            let isolated: u64 = env.storage().instance().get(&isolated_key).unwrap_or(0);
-            return isolated;
-        }
-    }
-
-    // Return normal payout (includes yield)
-    normal_payout
-}
 
 fn handle_default_yield_distribution(
     env: &Env,
@@ -1205,6 +925,8 @@ mod fuzz_tests {
             604800, // 1 week in seconds
             true,
             1,
+            86400, // 24 hour grace period
+            100,   // 1% late fee
         );
 
         let user1 = Address::generate(&env);
@@ -1249,6 +971,8 @@ mod fuzz_tests {
             604800, // 1 week in seconds
             true,
             1,
+            86400,
+            100,
         );
 
         let user2 = Address::generate(&env);
@@ -1295,6 +1019,8 @@ mod fuzz_tests {
                 604800, // 1 week in seconds
                 true,   // yield_enabled
                 1,      // risk_tolerance
+                86400,  // 24 hour grace period
+                100,    // 1% late fee
             );
 
             let user = Address::generate(&env);
@@ -1352,6 +1078,8 @@ mod fuzz_tests {
                 604800, // 1 week in seconds
                 true,
                 1,
+                86400,
+                100,
             );
 
             // Test joining with maximum allowed members
@@ -1396,6 +1124,8 @@ mod fuzz_tests {
             604800, // 1 week in seconds
             true,
             1,
+            86400,
+            100,
         );
 
         // Create multiple users and test deposits
@@ -1443,6 +1173,8 @@ mod fuzz_tests {
             604800, // 1 week in seconds
             true,
             1,
+            86400,
+            100,
         );
 
         // User joins the circle
@@ -1509,6 +1241,8 @@ mod fuzz_tests {
             604800, // 1 week in seconds
             true,
             1,
+            86400,
+            100,
         );
 
         // User joins the circle
@@ -1567,6 +1301,8 @@ mod fuzz_tests {
             604800,
             true, // yield_enabled
             1,    // risk_tolerance
+            86400,
+            100,
         );
 
         env.mock_all_auths();
@@ -1606,6 +1342,8 @@ mod fuzz_tests {
             604800,
             true,
             1,
+            86400,
+            100,
         );
 
         SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
