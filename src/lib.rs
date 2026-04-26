@@ -1,8 +1,12 @@
 #![cfg_attr(not(test), no_std)]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, Vec, Symbol, token, testutils::{Address as TestAddress}};
 use arbitrary::{Arbitrary, Unstructured};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, event, testutils::Address as TestAddress, token, Address,
+    Env, Symbol, Vec,
+};
 
 pub mod yield_allocation_voting;
+pub mod yield_strategy_trait;
 
 // --- DATA STRUCTURES ---
 
@@ -19,6 +23,15 @@ pub enum DataKey {
     GroupReserve,
     // New: Tracks amount currently in AMMs per circle
     RoutedAmount(u64),
+    // New: Tracks yield strategy address per circle
+    YieldStrategy(u64),
+    // New: Multisig governance for circles
+    MultisigSigners(u64),   // Vec<Address> of authorized signers for a circle
+    MultisigThreshold(u64), // Minimum signatures required (e.g., 2 for 2/3)
+    // New: Emergency pause flag
+    IsPaused,
+    // New: Emergency council signers for pause function
+    EmergencyCouncil,
 }
 
 #[contracttype]
@@ -35,16 +48,27 @@ pub struct Member {
 pub struct CircleInfo {
     pub id: u64,
     pub creator: Address,
-    pub contribution_amount: u64, // Optimized from i128 to u64
-    pub max_members: u32, // Optimized from u32 to u32
-    pub member_count: u32, // Track count separately from Vec
+    pub contribution_amount: u64,     // Optimized from i128 to u64
+    pub max_members: u32,             // Optimized from u32 to u32
+    pub member_count: u32,            // Track count separately from Vec
     pub current_recipient_index: u32, // Track by index instead of Address
     pub is_active: bool,
-    pub token: Address, // The token used (USDC, XLM)
+    pub token: Address,          // The token used (USDC, XLM)
     pub deadline_timestamp: u64, // Deadline for on-time payments
-    pub cycle_duration: u64, // Duration of each payment cycle in seconds
-    pub yield_enabled: bool, // NEW: Issue #289
-    pub risk_tolerance: u32, // NEW: Issue #289
+    pub cycle_duration: u64,     // Duration of each payment cycle in seconds
+    pub yield_enabled: bool,     // NEW: Issue #289
+    pub risk_tolerance: u32,     // NEW: Issue #289
+    pub multisig_enabled: bool,  // NEW: Multisig governance enabled
+    pub cycle_started: bool,     // NEW: Track if first cycle has started
+}
+
+// --- EVENTS ---
+
+#[event]
+pub struct EmergencyPauseEvent {
+    pub paused: bool,
+    pub timestamp: u64,
+    pub reason: Symbol,
 }
 
 // --- CONTRACT TRAIT ---
@@ -52,9 +76,18 @@ pub struct CircleInfo {
 pub trait SoroSusuTrait {
     // Initialize the contract
     fn init(env: Env, admin: Address);
-    
+
     // Create a new savings circle
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u32, token: Address, cycle_duration: u64, yield_enabled: bool, risk_tolerance: u32) -> u64;
+    fn create_circle(
+        env: Env,
+        creator: Address,
+        amount: u64,
+        max_members: u32,
+        token: Address,
+        cycle_duration: u64,
+        yield_enabled: bool,
+        risk_tolerance: u32,
+    ) -> u64;
 
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64);
@@ -66,27 +99,74 @@ pub trait SoroSusuTrait {
     fn route_to_yield(env: Env, circle_id: u64, amount: u64, pool_address: Address);
 
     // NEW: Issue #290
-    fn withdraw_from_yield(env: Env, circle_id: u64, amount_to_withdraw: u64, pool_address: Address);
+    fn withdraw_from_yield(
+        env: Env,
+        circle_id: u64,
+        amount_to_withdraw: u64,
+        pool_address: Address,
+    );
 
     // NEW: Issue #288
-    fn deposit_with_swap(env: Env, user: Address, circle_id: u64, source_token: Address, source_amount_max: u64);
+    fn deposit_with_swap(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        source_token: Address,
+        source_amount_max: u64,
+    );
 
     // --- Yield Allocation Voting Functions ---
-    
+
     // Initialize voting session for yield distribution
-    fn initialize_yield_voting(env: Env, circle_id: u64, available_strategies: Vec<Address>) -> Result<(), u32>;
-    
+    fn initialize_yield_voting(
+        env: Env,
+        circle_id: u64,
+        available_strategies: Vec<Address>,
+    ) -> Result<(), u32>;
+
     // Cast vote for yield distribution strategy
-    fn cast_yield_vote(env: Env, voter: Address, circle_id: u64, proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>) -> Result<(), u32>;
-    
+    fn cast_yield_vote(
+        env: Env,
+        voter: Address,
+        circle_id: u64,
+        proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>,
+    ) -> Result<(), u32>;
+
     // Finalize voting and determine winning strategy
-    fn finalize_yield_voting(env: Env, circle_id: u64) -> Result<Vec<yield_allocation_voting::DistributionStrategy>, u32>;
-    
+    fn finalize_yield_voting(
+        env: Env,
+        circle_id: u64,
+    ) -> Result<Vec<yield_allocation_voting::DistributionStrategy>, u32>;
+
     // Execute the winning distribution strategy
-    fn execute_yield_distribution(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32>;
-    
+    fn execute_yield_distribution(
+        env: Env,
+        circle_id: u64,
+        total_yield_amount: i128,
+    ) -> Result<(), u32>;
+
     // Finalize cycle with yield voting integration
     fn finalize_cycle(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32>;
+
+    // NEW: Project cycle yield for frontend display
+    fn project_cycle_yield(env: Env, circle_id: u64) -> Result<i128, u32>;
+
+    // NEW: Graduate to multisig governance after cycle starts
+    fn graduate_to_multisig(env: Env, circle_id: u64, signers: Vec<Address>, threshold: u32);
+
+    // NEW: Mark cycle as started (enables multisig graduation)
+    fn mark_cycle_started(env: Env, circle_id: u64);
+
+    // NEW: Admin action: Kick member (requires multisig after cycle starts)
+    fn kick_member(
+        env: Env,
+        circle_id: u64,
+        member_to_remove: Address,
+        signing_addresses: Vec<Address>,
+    );
+
+    // NEW: Emergency pause/resume for zero-day vulnerabilities
+    fn emergency_pause(env: Env, paused: bool, reason: Symbol, signing_addresses: Vec<Address>);
 }
 
 // --- IMPLEMENTATION ---
@@ -103,12 +183,34 @@ impl SoroSusuTrait for SoroSusu {
         }
         // Set the admin
         env.storage().instance().set(&DataKey::Admin, &admin);
+
+        // Initialize pause state to false (not paused)
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+
+        // Initialize emergency council with admin as initial member
+        let initial_council = vec![&env, admin.clone()];
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyCouncil, &initial_council);
     }
 
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u32, token: Address, cycle_duration: u64, yield_enabled: bool, risk_tolerance: u32) -> u64 {
+    fn create_circle(
+        env: Env,
+        creator: Address,
+        amount: u64,
+        max_members: u32,
+        token: Address,
+        cycle_duration: u64,
+        yield_enabled: bool,
+        risk_tolerance: u32,
+    ) -> u64 {
         // 1. Get the current Circle Count
-        let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
-        
+        let mut circle_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircleCount)
+            .unwrap_or(0);
+
         // 2. Increment the ID for the new circle
         circle_count += 1;
 
@@ -127,11 +229,17 @@ impl SoroSusuTrait for SoroSusu {
             cycle_duration,
             yield_enabled,
             risk_tolerance,
+            multisig_enabled: false, // Initially single-admin
+            cycle_started: false,    // Cycle hasn't started yet
         };
 
         // 4. Save the Circle and the new Count
-        env.storage().instance().set(&DataKey::Circle(circle_count), &new_circle);
-        env.storage().instance().set(&DataKey::CircleCount, &circle_count);
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_count), &new_circle);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircleCount, &circle_count);
 
         // 5. Initialize Group Reserve if not exists
         if !env.storage().instance().has(&DataKey::GroupReserve) {
@@ -143,11 +251,18 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn join_circle(env: Env, user: Address, circle_id: u64) {
+        // Check if contract is paused
+        require_not_paused(&env);
+
         // 1. Authorization: The user MUST sign this transaction
         user.require_auth();
 
         // 2. Retrieve the circle data
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
 
         // 3. Check if the circle is full
         if circle.member_count >= circle.max_members {
@@ -167,25 +282,37 @@ impl SoroSusuTrait for SoroSusu {
             contribution_count: 0,
             last_contribution_time: 0,
         };
-        
+
         // 6. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
         circle.member_count += 1;
-        
+
         // 7. Save the updated circle back to storage
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
     }
 
     fn deposit(env: Env, user: Address, circle_id: u64) {
-        // 1. Authorization: The user must sign this!
+        // 1. Check if contract is paused
+        require_not_paused(&env);
+
+        // 2. Authorization: The user must sign this!
         user.require_auth();
 
-        // 2. Load the Circle Data
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        // 3. Load the Circle Data
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
 
         // 3. Check if user is actually a member
         let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env.storage().instance().get(&member_key)
+        let mut member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
         // 4. Create the Token Client
@@ -198,39 +325,56 @@ impl SoroSusuTrait for SoroSusu {
         if current_time > circle.deadline_timestamp {
             // Calculate 1% penalty
             penalty_amount = circle.contribution_amount / 100; // 1% penalty
-            
+
             // Update Group Reserve balance
-            let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+            let mut reserve_balance: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::GroupReserve)
+                .unwrap_or(0);
             reserve_balance += penalty_amount;
-            env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
+            env.storage()
+                .instance()
+                .set(&DataKey::GroupReserve, &reserve_balance);
         }
 
         // 6. Transfer the full amount from user
         client.transfer(
-            &user, 
-            &env.current_contract_address(), 
-            &circle.contribution_amount
+            &user,
+            &env.current_contract_address(),
+            &circle.contribution_amount,
         );
 
         // 7. Update member contribution info
         member.has_contributed = true;
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
-        
+
         // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
 
         // 9. Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
 
         // 10. Mark as Paid in the old format for backward compatibility
-        env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Deposit(circle_id, user), &true);
     }
 
     fn route_to_yield(env: Env, circle_id: u64, amount: u64, pool_address: Address) {
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        
+        // Check if contract is paused
+        require_not_paused(&env);
+
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+
         // 1. Governance Check (#289)
         if !circle.yield_enabled {
             panic!("Yield routing is disabled for this circle");
@@ -254,33 +398,66 @@ impl SoroSusuTrait for SoroSusu {
         client.transfer(&env.current_contract_address(), &pool_address, &amount);
 
         // 5. Update Routed Amount storage
-        let mut routed_amount: u64 = env.storage().instance().get(&DataKey::RoutedAmount(circle_id)).unwrap_or(0);
+        let mut routed_amount: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoutedAmount(circle_id))
+            .unwrap_or(0);
         routed_amount += amount;
-        env.storage().instance().set(&DataKey::RoutedAmount(circle_id), &routed_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoutedAmount(circle_id), &routed_amount);
+
+        // 6. Store the strategy address for this circle
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldStrategy(circle_id), &pool_address);
     }
 
-    fn withdraw_from_yield(env: Env, circle_id: u64, amount_to_withdraw: u64, pool_address: Address) {
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
-        let mut routed_amount: u64 = env.storage().instance().get(&DataKey::RoutedAmount(circle_id)).unwrap_or(0);
+    fn withdraw_from_yield(
+        env: Env,
+        circle_id: u64,
+        amount_to_withdraw: u64,
+        pool_address: Address,
+    ) {
+        // Check if contract is paused
+        require_not_paused(&env);
+
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        let mut routed_amount: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoutedAmount(circle_id))
+            .unwrap_or(0);
 
         // 1. Simulate withdrawal from Pool (In real case, the contract would call the Pool's withdraw)
         // For this task, we assume the amount_to_withdraw is what we received back.
         // If there was a loss (e.g. IL), amount_to_withdraw might be less than what we expected.
-        
+
         // 2. Principal Protection (#290)
         let expected_principal = amount_to_withdraw.min(routed_amount); // Simplified principal tracking
-        
+
         // If we have a loss, pull from Reserve
         if amount_to_withdraw < expected_principal {
             let loss = expected_principal - amount_to_withdraw;
-            let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-            
+            let mut reserve_balance: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::GroupReserve)
+                .unwrap_or(0);
+
             if reserve_balance >= loss {
                 reserve_balance -= loss;
-                env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::GroupReserve, &reserve_balance);
                 // The contract now has the full principal back (amount_to_withdraw + loss from reserve)
             } else {
-                // If reserve is empty, we have a liquidity crunch! 
+                // If reserve is empty, we have a liquidity crunch!
                 // But as per #290, we must guarantee the principal.
                 panic!("Insufficient Group Reserve to cover yield loss");
             }
@@ -288,14 +465,29 @@ impl SoroSusuTrait for SoroSusu {
 
         // 3. Update Routed Amount
         routed_amount = routed_amount.saturating_sub(expected_principal);
-        env.storage().instance().set(&DataKey::RoutedAmount(circle_id), &routed_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoutedAmount(circle_id), &routed_amount);
     }
 
-    fn deposit_with_swap(env: Env, user: Address, circle_id: u64, source_token: Address, source_amount_max: u64) {
+    fn deposit_with_swap(
+        env: Env,
+        user: Address,
+        circle_id: u64,
+        source_token: Address,
+        source_amount_max: u64,
+    ) {
+        // Check if contract is paused
+        require_not_paused(&env);
+
         user.require_auth();
 
         // 1. Load Circle Data
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
         let target_token = circle.token.clone();
         let target_amount = circle.contribution_amount;
 
@@ -312,15 +504,22 @@ impl SoroSusuTrait for SoroSusu {
         // 4. Perform Atomic Swap (Simulated)
         // Transfer source asset from user to contract
         let source_client = token::Client::new(&env, &source_token);
-        source_client.transfer(&user, &env.current_contract_address(), &required_source_amount);
+        source_client.transfer(
+            &user,
+            &env.current_contract_address(),
+            &required_source_amount,
+        );
 
         // Here the contract would call the DEX to swap source_token for target_token
         // For the sake of this task, we'll assume the swap happened and the contract now has target_amount
-        
+
         // 5. Finalize Deposit
         // (Re-using logic from deposit function)
         let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env.storage().instance().get(&member_key)
+        let mut member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member"));
 
         member.has_contributed = true;
@@ -330,30 +529,49 @@ impl SoroSusuTrait for SoroSusu {
 
         // Update circle deadline
         circle.deadline_timestamp = env.ledger().timestamp() + circle.cycle_duration;
-        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
 
         // Mark as paid
-        env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::Deposit(circle_id, user), &true);
     }
 
     // --- Yield Allocation Voting Implementation ---
 
-    fn initialize_yield_voting(env: Env, circle_id: u64, available_strategies: Vec<Address>) -> Result<(), u32> {
+    fn initialize_yield_voting(
+        env: Env,
+        circle_id: u64,
+        available_strategies: Vec<Address>,
+    ) -> Result<(), u32> {
         yield_allocation_voting::initialize_voting_session(&env, circle_id, available_strategies)
             .map_err(|e| e as u32)
     }
 
-    fn cast_yield_vote(env: Env, voter: Address, circle_id: u64, proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>) -> Result<(), u32> {
+    fn cast_yield_vote(
+        env: Env,
+        voter: Address,
+        circle_id: u64,
+        proposed_strategies: Vec<yield_allocation_voting::DistributionStrategy>,
+    ) -> Result<(), u32> {
         yield_allocation_voting::cast_vote(&env, voter, circle_id, proposed_strategies)
             .map_err(|e| e as u32)
     }
 
-    fn finalize_yield_voting(env: Env, circle_id: u64) -> Result<Vec<yield_allocation_voting::DistributionStrategy>, u32> {
-        yield_allocation_voting::finalize_voting(&env, circle_id)
-            .map_err(|e| e as u32)
+    fn finalize_yield_voting(
+        env: Env,
+        circle_id: u64,
+    ) -> Result<Vec<yield_allocation_voting::DistributionStrategy>, u32> {
+        yield_allocation_voting::finalize_voting(&env, circle_id).map_err(|e| e as u32)
     }
 
-    fn execute_yield_distribution(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32> {
+    fn execute_yield_distribution(
+        env: Env,
+        circle_id: u64,
+        total_yield_amount: i128,
+    ) -> Result<(), u32> {
         yield_allocation_voting::execute_distribution_strategy(&env, circle_id, total_yield_amount)
             .map_err(|e| e as u32)
     }
@@ -361,7 +579,7 @@ impl SoroSusuTrait for SoroSusu {
     fn finalize_cycle(env: Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32> {
         // Check if voting session exists and is ready to be finalized
         let voting_session = yield_allocation_voting::get_voting_session(&env, circle_id);
-        
+
         match voting_session {
             Ok(session) => {
                 // Voting session exists, finalize it first
@@ -369,13 +587,18 @@ impl SoroSusuTrait for SoroSusu {
                     let current_time = env.ledger().timestamp();
                     if current_time > session.end_timestamp {
                         // Voting period is over, finalize voting
-                        let winning_strategy = yield_allocation_voting::finalize_voting(&env, circle_id)
-                            .map_err(|e| e as u32)?;
-                        
+                        let winning_strategy =
+                            yield_allocation_voting::finalize_voting(&env, circle_id)
+                                .map_err(|e| e as u32)?;
+
                         // Execute the winning strategy
-                        yield_allocation_voting::execute_distribution_strategy(&env, circle_id, total_yield_amount)
-                            .map_err(|e| e as u32)?;
-                        
+                        yield_allocation_voting::execute_distribution_strategy(
+                            &env,
+                            circle_id,
+                            total_yield_amount,
+                        )
+                        .map_err(|e| e as u32)?;
+
                         Ok(())
                     } else {
                         // Voting period is still active
@@ -383,8 +606,12 @@ impl SoroSusuTrait for SoroSusu {
                     }
                 } else {
                     // Voting already finalized, just execute distribution
-                    yield_allocation_voting::execute_distribution_strategy(&env, circle_id, total_yield_amount)
-                        .map_err(|e| e as u32)
+                    yield_allocation_voting::execute_distribution_strategy(
+                        &env,
+                        circle_id,
+                        total_yield_amount,
+                    )
+                    .map_err(|e| e as u32)
                 }
             }
             Err(_) => {
@@ -394,28 +621,303 @@ impl SoroSusuTrait for SoroSusu {
             }
         }
     }
+
+    fn project_cycle_yield(env: Env, circle_id: u64) -> Result<i128, u32> {
+        // 1. Get circle info
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .ok_or(401)?; // Circle not found
+
+        // 2. Check if yield is enabled for this circle
+        if !circle.yield_enabled {
+            return Err(402); // Yield not enabled
+        }
+
+        // 3. Get the strategy address for this circle
+        let strategy_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::YieldStrategy(circle_id))
+            .ok_or(403)?; // No strategy configured
+
+        // 4. Call the strategy to get current APY
+        let strategy_client =
+            yield_strategy_trait::YieldStrategyClient::new(&env, &strategy_address);
+        let strategy_info = strategy_client.get_strategy_info(&env);
+
+        // 5. Get the routed amount (principal) for this circle
+        let routed_amount: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoutedAmount(circle_id))
+            .unwrap_or(0);
+
+        if routed_amount == 0 {
+            return Ok(0); // No funds routed, no yield
+        }
+
+        // 6. Calculate estimated yield for the entire cycle duration
+        // Use the helper function from yield_strategy_trait
+        let yield_estimate = yield_strategy_trait::calculate_estimated_yield(
+            routed_amount as i128,
+            strategy_info.default_apy_bps,
+            circle.cycle_duration,
+            10000, // Max confidence for current APY
+        );
+
+        Ok(yield_estimate.estimated_yield)
+    }
+
+    fn graduate_to_multisig(env: Env, circle_id: u64, signers: Vec<Address>, threshold: u32) {
+        // 1. Get circle info
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // 2. Validate that cycle has started
+        if !circle.cycle_started {
+            panic!("Cannot graduate to multisig before cycle starts");
+        }
+
+        // 3. Validate that multisig is not already enabled
+        if circle.multisig_enabled {
+            panic!("Multisig is already enabled for this circle");
+        }
+
+        // 4. Validate threshold (must be at least 2 for 2/3 majority with 3 signers)
+        if threshold < 2 {
+            panic!("Threshold must be at least 2");
+        }
+
+        // 5. Validate signers count (must be at least 3)
+        if signers.len() < 3 {
+            panic!("Must have at least 3 signers for multisig");
+        }
+
+        // 6. Validate threshold doesn't exceed signers count
+        if threshold > signers.len() as u32 {
+            panic!("Threshold cannot exceed number of signers");
+        }
+
+        // 7. Validate all signers are active members of the circle
+        for signer in signers.iter() {
+            let member_key = DataKey::Member(signer.clone());
+            let member: Member = env
+                .storage()
+                .instance()
+                .get(&member_key)
+                .expect("Signer is not a member of this circle");
+
+            if !member.has_contributed {
+                panic!("Signer has not contributed to the circle");
+            }
+        }
+
+        // 8. Store the multisig configuration
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigSigners(circle_id), &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigThreshold(circle_id), &threshold);
+
+        // 9. Update circle to enable multisig
+        circle.multisig_enabled = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn mark_cycle_started(env: Env, circle_id: u64) {
+        // 1. Get circle info
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // 2. Mark cycle as started
+        circle.cycle_started = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn kick_member(
+        env: Env,
+        circle_id: u64,
+        member_to_remove: Address,
+        signing_addresses: Vec<Address>,
+    ) {
+        // 1. Validate multisig authorization
+        validate_multisig_auth(&env, circle_id, signing_addresses);
+
+        // 2. Get circle info
+        let mut circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // 3. Verify member exists
+        let member_key = DataKey::Member(member_to_remove.clone());
+        let member: Member = env
+            .storage()
+            .instance()
+            .get(&member_key)
+            .expect("Member not found");
+
+        // 4. Cannot kick the creator
+        if member_to_remove == circle.creator {
+            panic!("Cannot kick the circle creator");
+        }
+
+        // 5. Remove member from storage
+        env.storage().instance().remove(&member_key);
+
+        // 6. Update circle member count
+        circle.member_count -= 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn emergency_pause(env: Env, paused: bool, reason: Symbol, signing_addresses: Vec<Address>) {
+        // 1. Validate emergency council multisig authorization
+        let council: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyCouncil)
+            .expect("Emergency council not configured");
+
+        // Require at least 2/3 of council to sign
+        let threshold = ((council.len() as u32) * 2 + 2) / 3; // Ceiling of 2/3
+
+        let mut valid_signature_count = 0u32;
+        for signer in signing_addresses.iter() {
+            if council.contains(signer) {
+                signer.require_auth_for_args((paused, reason.clone()));
+                valid_signature_count += 1;
+            }
+        }
+
+        if valid_signature_count < threshold {
+            panic!(
+                "Insufficient emergency council signatures: required {}, got {}",
+                threshold, valid_signature_count
+            );
+        }
+
+        // 2. Update pause state
+        env.storage().instance().set(&DataKey::IsPaused, &paused);
+
+        // 3. Emit critical event for off-chain monitors
+        env.events().publish(
+            (Symbol::new(&env, "emergency_pause"),),
+            EmergencyPauseEvent {
+                paused,
+                timestamp: env.ledger().timestamp(),
+                reason,
+            },
+        );
+    }
 }
 
 // --- HELPER FUNCTIONS ---
 
-fn handle_default_yield_distribution(env: &Env, circle_id: u64, total_yield_amount: i128) -> Result<(), u32> {
+fn require_not_paused(env: &Env) {
+    let is_paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::IsPaused)
+        .unwrap_or(false);
+    if is_paused {
+        panic!("Contract is paused due to emergency. All state-changing operations are suspended.");
+    }
+}
+
+fn validate_multisig_auth(env: &Env, circle_id: u64, signing_addresses: Vec<Address>) {
+    // Get circle info
+    let circle: CircleInfo = env
+        .storage()
+        .instance()
+        .get(&DataKey::Circle(circle_id))
+        .expect("Circle not found");
+
+    // If multisig is not enabled, allow single admin (creator) auth
+    if !circle.multisig_enabled {
+        circle.creator.require_auth();
+        return;
+    }
+
+    // Get multisig configuration
+    let authorized_signers: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultisigSigners(circle_id))
+        .expect("Multisig signers not configured");
+
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultisigThreshold(circle_id))
+        .expect("Multisig threshold not configured");
+
+    // Validate that all provided signers are authorized
+    let mut valid_signature_count = 0u32;
+    for signer in signing_addresses.iter() {
+        // Check if this signer is in the authorized list
+        if authorized_signers.contains(signer) {
+            // Use require_auth_for_args to validate signature at host level
+            // This will fail if the signer didn't actually sign the transaction
+            signer.require_auth_for_args((circle_id,));
+            valid_signature_count += 1;
+        }
+    }
+
+    // Verify we have enough signatures
+    if valid_signature_count < threshold {
+        panic!(
+            "Insufficient signatures: required {}, got {}",
+            threshold, valid_signature_count
+        );
+    }
+}
+
+fn handle_default_yield_distribution(
+    env: &Env,
+    circle_id: u64,
+    total_yield_amount: i128,
+) -> Result<(), u32> {
     // Default yield distribution logic when no voting session exists
     // This could be a simple strategy like distributing equally to all members
     // or using a predefined safe strategy
-    
-    let circle: CircleInfo = env.storage().instance()
+
+    let circle: CircleInfo = env
+        .storage()
+        .instance()
         .get(&DataKey::Circle(circle_id))
         .ok_or(401)?; // Unauthorized
-    
+
     // For now, we'll just keep the yield in the contract
     // In production, this would route to a default safe strategy
     // or distribute to members proportionally
-    
+
     // Update routed amount to track yield
-    let mut routed_amount: u64 = env.storage().instance().get(&DataKey::RoutedAmount(circle_id)).unwrap_or(0);
+    let mut routed_amount: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::RoutedAmount(circle_id))
+        .unwrap_or(0);
     routed_amount += total_yield_amount as u64;
-    env.storage().instance().set(&DataKey::RoutedAmount(circle_id), &routed_amount);
-    
+    env.storage()
+        .instance()
+        .set(&DataKey::RoutedAmount(circle_id), &routed_amount);
+
     Ok(())
 }
 
@@ -465,14 +967,21 @@ mod fuzz_tests {
 
         // Mock token balance for the test
         env.mock_all_auths();
-        
+
         // This should not panic even with u64::MAX contribution amount
         let result = std::panic::catch_unwind(|| {
             SoroSusuTrait::deposit(env.clone(), user1.clone(), max_circle_id);
         });
-        
+
         // The transfer might fail due to insufficient balance, but it shouldn't panic from overflow
-        assert!(result.is_ok() || result.unwrap_err().downcast::<String>().unwrap().contains("insufficient balance"));
+        assert!(
+            result.is_ok()
+                || result
+                    .unwrap_err()
+                    .downcast::<String>()
+                    .unwrap()
+                    .contains("insufficient balance")
+        );
     }
 
     #[test]
@@ -501,12 +1010,12 @@ mod fuzz_tests {
         SoroSusuTrait::join_circle(env.clone(), user2.clone(), zero_circle_id);
 
         env.mock_all_auths();
-        
+
         // Zero amount deposit should work (though may not be practically useful)
         let result = std::panic::catch_unwind(|| {
             SoroSusuTrait::deposit(env.clone(), user2.clone(), zero_circle_id);
         });
-        
+
         assert!(result.is_ok());
     }
 
@@ -521,13 +1030,14 @@ mod fuzz_tests {
         SoroSusuTrait::init(env.clone(), admin.clone());
 
         // Test with various edge case amounts
-        let test_amounts = vec![&env,
-            1,                           // Minimum positive amount
-            u32::MAX as u64,            // Large but reasonable amount
-            u64::MAX / 2,               // Very large amount
-            u64::MAX - 1,               // Maximum amount - 1
-            1000000,                    // 1 million
-            0,                          // Zero (already tested above)
+        let test_amounts = vec![
+            &env,
+            1,               // Minimum positive amount
+            u32::MAX as u64, // Large but reasonable amount
+            u64::MAX / 2,    // Very large amount
+            u64::MAX - 1,    // Maximum amount - 1
+            1000000,         // 1 million
+            0,               // Zero (already tested above)
         ];
 
         for (i, amount) in test_amounts.into_iter().enumerate() {
@@ -538,19 +1048,19 @@ mod fuzz_tests {
                 10,
                 token.clone(),
                 604800, // 1 week in seconds
-                true, // yield_enabled
-                1, // risk_tolerance
+                true,   // yield_enabled
+                1,      // risk_tolerance
             );
 
             let user = Address::generate(&env);
             SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
 
             env.mock_all_auths();
-            
+
             let result = std::panic::catch_unwind(|| {
                 SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
             });
-            
+
             // Should not panic due to overflow, only potentially due to insufficient balance
             match result {
                 Ok(_) => {
@@ -559,9 +1069,11 @@ mod fuzz_tests {
                 Err(e) => {
                     let error_msg = e.downcast::<String>().unwrap();
                     // Expected error: insufficient balance, not overflow
-                    assert!(error_msg.contains("insufficient balance") || 
-                           error_msg.contains("underflow") ||
-                           error_msg.contains("overflow"));
+                    assert!(
+                        error_msg.contains("insufficient balance")
+                            || error_msg.contains("underflow")
+                            || error_msg.contains("overflow")
+                    );
                 }
             }
         }
@@ -578,7 +1090,8 @@ mod fuzz_tests {
         SoroSusuTrait::init(env.clone(), admin.clone());
 
         // Test boundary conditions for max_members
-        let boundary_tests = vec![&env,
+        let boundary_tests = vec![
+            &env,
             (1, "Minimum members"),
             (u32::MAX, "Maximum members"),
             (100, "Typical circle size"),
@@ -597,17 +1110,24 @@ mod fuzz_tests {
             );
 
             // Test joining with maximum allowed members
-            for i in 0..max_members.min(10) { // Limit to 10 for test performance
+            for i in 0..max_members.min(10) {
+                // Limit to 10 for test performance
                 let user = Address::generate(&env);
                 SoroSusuTrait::join_circle(env.clone(), user.clone(), circle_id);
-                
+
                 env.mock_all_auths();
-                
+
                 let result = std::panic::catch_unwind(|| {
                     SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
                 });
-                
-                assert!(result.is_ok(), "Deposit failed for {} with max_members {}: {:?}", description, max_members, result);
+
+                assert!(
+                    result.is_ok(),
+                    "Deposit failed for {} with max_members {}: {:?}",
+                    description,
+                    max_members,
+                    result
+                );
             }
         }
     }
@@ -648,8 +1168,12 @@ mod fuzz_tests {
             let result = std::panic::catch_unwind(|| {
                 SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
             });
-            
-            assert!(result.is_ok(), "Concurrent deposit test failed: {:?}", result);
+
+            assert!(
+                result.is_ok(),
+                "Concurrent deposit test failed: {:?}",
+                result
+            );
         }
     }
 
@@ -683,22 +1207,34 @@ mod fuzz_tests {
         env.mock_all_auths();
 
         // Get initial Group Reserve balance
-        let initial_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        let initial_reserve: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GroupReserve)
+            .unwrap_or(0);
         assert_eq!(initial_reserve, 0);
 
         // Simulate time passing beyond deadline (jump forward 2 weeks)
-        env.ledger().set_timestamp(env.ledger().timestamp() + 2 * 604800);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 2 * 604800);
 
         // Make a late deposit
         let result = std::panic::catch_unwind(|| {
             SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
         });
-        
+
         assert!(result.is_ok(), "Late deposit should succeed: {:?}", result);
 
         // Check that Group Reserve received the 1% penalty (10 tokens)
-        let final_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-        assert_eq!(final_reserve, 10, "Group Reserve should have 10 tokens (1% penalty)");
+        let final_reserve: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GroupReserve)
+            .unwrap_or(0);
+        assert_eq!(
+            final_reserve, 10,
+            "Group Reserve should have 10 tokens (1% penalty)"
+        );
 
         // Verify member was marked as having contributed
         let member_key = DataKey::Member(user.clone());
@@ -737,19 +1273,34 @@ mod fuzz_tests {
         env.mock_all_auths();
 
         // Get initial Group Reserve balance
-        let initial_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
+        let initial_reserve: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GroupReserve)
+            .unwrap_or(0);
         assert_eq!(initial_reserve, 0);
 
         // Make an on-time deposit (don't advance time)
         let result = std::panic::catch_unwind(|| {
             SoroSusuTrait::deposit(env.clone(), user.clone(), circle_id);
         });
-        
-        assert!(result.is_ok(), "On-time deposit should succeed: {:?}", result);
+
+        assert!(
+            result.is_ok(),
+            "On-time deposit should succeed: {:?}",
+            result
+        );
 
         // Check that Group Reserve received no penalty
-        let final_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
-        assert_eq!(final_reserve, 0, "Group Reserve should have 0 tokens for on-time deposit");
+        let final_reserve: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GroupReserve)
+            .unwrap_or(0);
+        assert_eq!(
+            final_reserve, 0,
+            "Group Reserve should have 0 tokens for on-time deposit"
+        );
     }
 
     #[test]
@@ -782,7 +1333,11 @@ mod fuzz_tests {
         SoroSusuTrait::withdraw_from_yield(env.clone(), circle_id, 500, pool.clone());
 
         // Check routed amount is 0
-        let routed_amount: u64 = env.storage().instance().get(&DataKey::RoutedAmount(circle_id)).unwrap_or(0);
+        let routed_amount: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoutedAmount(circle_id))
+            .unwrap_or(0);
         assert_eq!(routed_amount, 0);
     }
 
@@ -814,11 +1369,575 @@ mod fuzz_tests {
 
         // Deposit with swap (10:1 rate in mock implementation)
         // 100 * 10 = 1000 required. We provide 1100 max.
-        SoroSusuTrait::deposit_with_swap(env.clone(), user.clone(), circle_id, source_token.clone(), 1100);
+        SoroSusuTrait::deposit_with_swap(
+            env.clone(),
+            user.clone(),
+            circle_id,
+            source_token.clone(),
+            1100,
+        );
 
         // Verify contribution
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).unwrap();
         assert!(member.has_contributed);
+    }
+
+    #[test]
+    fn test_project_cycle_yield() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+        let strategy = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create a circle with yield enabled
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800, // 1 week cycle duration
+            true,   // yield_enabled
+            1,      // risk_tolerance
+        );
+
+        // Route funds to yield (this stores the strategy address)
+        env.mock_all_auths();
+        SoroSusuTrait::route_to_yield(env.clone(), circle_id, 500, strategy.clone());
+
+        // Test project_cycle_yield when no strategy is actually deployed
+        // This will fail because the strategy doesn't exist, but we can test the error path
+        let result = SoroSusuTrait::project_cycle_yield(env.clone(), circle_id);
+
+        // Should fail because the strategy contract doesn't actually implement the interface
+        assert!(result.is_err());
+
+        // Test with yield disabled
+        let circle_id_no_yield = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            false, // yield_enabled = false
+            1,
+        );
+
+        let result = SoroSusuTrait::project_cycle_yield(env.clone(), circle_id_no_yield);
+        assert_eq!(result.unwrap_err(), 402); // Yield not enabled error
+
+        // Test with non-existent circle
+        let result = SoroSusuTrait::project_cycle_yield(env.clone(), 999);
+        assert_eq!(result.unwrap_err(), 401); // Circle not found error
+    }
+
+    #[test]
+    fn test_mark_cycle_started() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Initially cycle_started should be false
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        assert!(!circle.cycle_started);
+
+        // Mark cycle as started
+        SoroSusuTrait::mark_cycle_started(env.clone(), circle_id);
+
+        // Now cycle_started should be true
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        assert!(circle.cycle_started);
+    }
+
+    #[test]
+    fn test_graduate_to_multisig() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Add members
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
+
+        // Mark members as having contributed
+        env.mock_all_auths();
+        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
+        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::deposit(env.clone(), user3.clone(), circle_id);
+
+        // Mark cycle as started
+        SoroSusuTrait::mark_cycle_started(env.clone(), circle_id);
+
+        // Graduate to multisig with 3 signers and threshold of 2
+        let signers = vec![&env, user1.clone(), user2.clone(), user3.clone()];
+        SoroSusuTrait::graduate_to_multisig(env.clone(), circle_id, signers, 2);
+
+        // Verify multisig is enabled
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        assert!(circle.multisig_enabled);
+
+        // Verify signers are stored
+        let stored_signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigSigners(circle_id))
+            .unwrap();
+        assert_eq!(stored_signers.len(), 3);
+
+        // Verify threshold is stored
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigThreshold(circle_id))
+            .unwrap();
+        assert_eq!(threshold, 2);
+    }
+
+    #[test]
+    fn test_graduate_to_multisig_before_cycle_starts() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Try to graduate before cycle starts - should fail
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let signers = vec![&env, user1, user2, user3];
+
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::graduate_to_multisig(env.clone(), circle_id, signers, 2);
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kick_member_single_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Add a member
+        let user1 = Address::generate(&env);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+
+        // Kick member with single admin (creator)
+        env.mock_all_auths();
+        SoroSusuTrait::kick_member(
+            env.clone(),
+            circle_id,
+            user1.clone(),
+            vec![&env, creator.clone()],
+        );
+
+        // Verify member is removed
+        let member_key = DataKey::Member(user1.clone());
+        assert!(!env.storage().instance().has(&member_key));
+
+        // Verify member count decreased
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .unwrap();
+        assert_eq!(circle.member_count, 0);
+    }
+
+    #[test]
+    fn test_kick_member_multisig() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Add members
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let user4 = Address::generate(&env);
+
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user4.clone(), circle_id);
+
+        // Mark members as having contributed
+        env.mock_all_auths();
+        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
+        SoroSusuTrait::deposit(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::deposit(env.clone(), user3.clone(), circle_id);
+        SoroSusuTrait::deposit(env.clone(), user4.clone(), circle_id);
+
+        // Mark cycle as started
+        SoroSusuTrait::mark_cycle_started(env.clone(), circle_id);
+
+        // Graduate to multisig
+        let signers = vec![&env, user1.clone(), user2.clone(), user3.clone()];
+        SoroSusuTrait::graduate_to_multisig(env.clone(), circle_id, signers, 2);
+
+        // Kick user4 with 2 authorized signatures
+        SoroSusuTrait::kick_member(
+            env.clone(),
+            circle_id,
+            user4.clone(),
+            vec![&env, user1.clone(), user2.clone()],
+        );
+
+        // Verify member is removed
+        let member_key = DataKey::Member(user4.clone());
+        assert!(!env.storage().instance().has(&member_key));
+    }
+
+    #[test]
+    fn test_cannot_kick_creator() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Try to kick the creator - should fail
+        env.mock_all_auths();
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::kick_member(
+                env.clone(),
+                circle_id,
+                creator.clone(),
+                vec![&env, creator.clone()],
+            );
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_pause_blocks_deposits() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        let user1 = Address::generate(&env);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+
+        // Pause the contract
+        env.mock_all_auths();
+        SoroSusuTrait::emergency_pause(
+            env.clone(),
+            true,
+            Symbol::new(&env, "zero_day_vulnerability"),
+            vec![&env, admin.clone()],
+        );
+
+        // Try to deposit - should fail
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_pause_blocks_route_to_yield() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Pause the contract
+        env.mock_all_auths();
+        SoroSusuTrait::emergency_pause(
+            env.clone(),
+            true,
+            Symbol::new(&env, "security_incident"),
+            vec![&env, admin.clone()],
+        );
+
+        // Try to route to yield - should fail
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::route_to_yield(env.clone(), circle_id, 500, pool.clone());
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_pause_blocks_join_circle() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        // Pause the contract
+        env.mock_all_auths();
+        SoroSusuTrait::emergency_pause(
+            env.clone(),
+            true,
+            Symbol::new(&env, "emergency"),
+            vec![&env, admin.clone()],
+        );
+
+        // Try to join circle - should fail
+        let user1 = Address::generate(&env);
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_resume_allows_operations() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            true,
+            1,
+        );
+
+        let user1 = Address::generate(&env);
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+
+        // Pause the contract
+        env.mock_all_auths();
+        SoroSusuTrait::emergency_pause(
+            env.clone(),
+            true,
+            Symbol::new(&env, "test_pause"),
+            vec![&env, admin.clone()],
+        );
+
+        // Resume the contract
+        SoroSusuTrait::emergency_pause(
+            env.clone(),
+            false,
+            Symbol::new(&env, "resolved"),
+            vec![&env, admin.clone()],
+        );
+
+        // Deposit should now work
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
+        });
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_emergency_pause_emits_event() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Pause the contract and capture events
+        env.mock_all_auths();
+        SoroSusuTrait::emergency_pause(
+            env.clone(),
+            true,
+            Symbol::new(&env, "critical_vulnerability"),
+            vec![&env, admin.clone()],
+        );
+
+        // Verify event was emitted
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    #[test]
+    fn test_emergency_pause_requires_council_signatures() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let council1 = Address::generate(&env);
+        let council2 = Address::generate(&env);
+        let council3 = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Update emergency council to have 3 members
+        let new_council = vec![&env, council1.clone(), council2.clone(), council3.clone()];
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyCouncil, &new_council);
+
+        // Try to pause with only 1 signature (should fail - needs 2/3 = 2)
+        env.mock_all_auths();
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::emergency_pause(
+                env.clone(),
+                true,
+                Symbol::new(&env, "test"),
+                vec![&env, council1.clone()],
+            );
+        });
+
+        assert!(result.is_err());
+
+        // Try with 2 signatures (should succeed)
+        let result = std::panic::catch_unwind(|| {
+            SoroSusuTrait::emergency_pause(
+                env.clone(),
+                true,
+                Symbol::new(&env, "test"),
+                vec![&env, council1.clone(), council2.clone()],
+            );
+        });
+
+        assert!(result.is_ok());
     }
 }
