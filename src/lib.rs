@@ -6,6 +6,7 @@ use soroban_sdk::{
 };
 
 pub mod yield_allocation_voting;
+pub mod yield_strategy_trait;
 
 // --- DATA STRUCTURES ---
 
@@ -243,6 +244,15 @@ impl SoroSusuTrait for SoroSusu {
         }
         // Set the admin
         env.storage().instance().set(&DataKey::Admin, &admin);
+
+        // Initialize pause state to false (not paused)
+        env.storage().instance().set(&DataKey::IsPaused, &false);
+
+        // Initialize emergency council with admin as initial member
+        let initial_council = vec![&env, admin.clone()];
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyCouncil, &initial_council);
     }
 
     fn create_circle(
@@ -303,6 +313,9 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn join_circle(env: Env, user: Address, circle_id: u64) {
+        // Check if contract is paused
+        require_not_paused(&env);
+
         // 1. Authorization: The user MUST sign this transaction
         user.require_auth();
 
@@ -351,7 +364,10 @@ impl SoroSusuTrait for SoroSusu {
     }
 
     fn deposit(env: Env, user: Address, circle_id: u64) {
-        // 1. Authorization: The user must sign this!
+        // 1. Check if contract is paused
+        require_not_paused(&env);
+
+        // 2. Authorization: The user must sign this!
         user.require_auth();
 
         // 2. Load the Circle Data
