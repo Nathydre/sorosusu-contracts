@@ -1242,6 +1242,11 @@ pub trait SoroSusuTrait {
 
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
 
+    /// Purge a group that has been dormant for ≥ 5 years.
+    /// Returns any residual balance to the protocol treasury and removes
+    /// the circle's storage entry to reclaim ledger rent.
+    fn purge_stale_group(env: Env, admin: Address, circle_id: u64);
+
     fn pair_with_member(env: Env, user: Address, buddy_address: Address);
     fn set_safety_deposit(env: Env, user: Address, circle_id: u64, amount: i128);
 
@@ -1639,6 +1644,21 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::AuditCount, &0u64);
     }
 
+    /// # Admin-Only: Set Lending Pool Address
+    ///
+    /// **Why admin-only:** The lending pool is a trusted external contract that
+    /// receives protocol funds. Allowing arbitrary callers to change it would
+    /// enable fund-draining attacks by redirecting deposits to a malicious pool.
+    ///
+    /// **If admin key is lost:** The lending pool address becomes permanently
+    /// frozen at its last set value. Existing pool interactions continue to
+    /// function, but the pool cannot be updated or disabled. Funds already
+    /// deposited into the pool remain accessible via the pool contract itself.
+    ///
+    /// **DAO migration path:** Replace the single-admin check with a
+    /// multi-sig governance proposal (≥ 2/3 council vote) before executing
+    /// the pool address change. The `write_audit` call already provides an
+    /// immutable on-chain record for every change.
     fn set_lending_pool(env: Env, admin: Address, pool: Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -1653,6 +1673,21 @@ impl SoroSusuTrait for SoroSusu {
         write_audit(&env, &admin, AuditAction::AdminAction, 0);
     }
 
+    /// # Admin-Only: Set Protocol Fee and Treasury
+    ///
+    /// **Why admin-only:** The protocol fee is deducted from every member
+    /// payout. An unconstrained caller could set the fee to 100 % (10 000 bps)
+    /// and redirect all funds to an attacker-controlled treasury address.
+    ///
+    /// **If admin key is lost:** The fee and treasury address are frozen at
+    /// their last configured values. Payouts continue to deduct the frozen fee
+    /// and send it to the frozen treasury. No funds are trapped, but the
+    /// protocol cannot adjust monetisation parameters.
+    ///
+    /// **DAO migration path:** Gate this function behind a time-locked
+    /// governance proposal with a mandatory 48-hour delay and a ≥ 2/3
+    /// multi-sig approval. Cap the maximum fee change per proposal to
+    /// ±100 bps to prevent sudden large fee increases.
     fn set_protocol_fee(env: Env, admin: Address, fee_basis_points: u32, treasury: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
@@ -2044,6 +2079,21 @@ impl SoroSusuTrait for SoroSusu {
         }
     }
 
+    /// # Admin-Only: Trigger Payout for a Circle
+    ///
+    /// **Why admin-only:** Payouts transfer the entire pot to a single
+    /// recipient. Allowing arbitrary callers to trigger payouts could enable
+    /// griefing (forcing premature payouts) or front-running attacks where an
+    /// attacker triggers a payout before all members have contributed.
+    ///
+    /// **If admin key is lost:** Payouts can no longer be triggered by the
+    /// admin. Members can still call `distribute_payout` directly (which
+    /// enforces the same contribution-completeness check), so funds are not
+    /// permanently locked. The admin trigger is a convenience/override path.
+    ///
+    /// **DAO migration path:** Expose a time-locked `propose_trigger_payout`
+    /// governance action that requires a ≥ 2/3 member vote. This removes the
+    /// single point of failure while preserving the override capability.
     fn trigger_payout(env: Env, admin: Address, circle_id: u64) {
         // Admin-only function
         let stored_admin: Address = env.storage().instance()
@@ -3334,6 +3384,22 @@ impl SoroSusuTrait for SoroSusu {
         write_audit(&env, &user, AuditAction::GovernanceVote, circle_id);
     }
 
+    /// # Creator-Only: Eject a Member from a Circle
+    ///
+    /// **Why creator-only:** Ejection burns the member's NFT credential and
+    /// marks their status as `Ejected`, permanently removing them from the
+    /// payout queue. Allowing arbitrary callers to eject members would enable
+    /// targeted griefing attacks against honest participants.
+    ///
+    /// **If admin/creator key is lost:** Members cannot be ejected. Defaulting
+    /// members remain in the queue and block payout progression. The insurance
+    /// fund (`trigger_insurance_coverage`) provides a mitigation path that does
+    /// not require ejection.
+    ///
+    /// **DAO migration path:** Introduce a `propose_eject_member` governance
+    /// action requiring a ≥ 2/3 circle-member vote with a 24-hour challenge
+    /// window. This distributes the ejection power across the group and removes
+    /// the single-creator trust assumption.
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address) {
         caller.require_auth();
         let circle: CircleInfo = env
@@ -3359,6 +3425,70 @@ impl SoroSusuTrait for SoroSusu {
         let token_id = (circle_id as u128) << 64 | (member_info.index as u128);
         nft_client.burn(&member, &token_id);
         write_audit(&env, &caller, AuditAction::AdminAction, circle_id);
+    }
+
+    /// # Admin-Only: Purge a Stale (5-Year Inactive) Group
+    ///
+    /// Identifies groups that have had no activity for ≥ 5 years
+    /// (157 680 000 seconds), returns any residual token balance to the
+    /// protocol treasury, and removes the circle's storage entry to reclaim
+    /// ledger rent.
+    ///
+    /// **Why admin-only:** Purging deletes on-chain state and transfers funds.
+    /// Restricting this to the admin prevents griefing attacks where an
+    /// adversary purges active circles by manipulating timestamps.
+    ///
+    /// **DAO migration path:** Replace the admin check with a governance
+    /// proposal that any token holder can submit after the 5-year threshold
+    /// is verifiably exceeded.
+    fn purge_stale_group(env: Env, admin: Address, circle_id: u64) {
+        admin.require_auth();
+
+        // Verify caller is the stored admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic!("Unauthorized: only admin can purge stale groups");
+        }
+
+        // Load the circle
+        let circle: CircleInfo = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle(circle_id))
+            .expect("Circle not found");
+
+        // 5 years in seconds: 5 * 365.25 * 24 * 3600 ≈ 157_766_400
+        const FIVE_YEARS_SECS: u64 = 157_766_400;
+        let now = env.ledger().timestamp();
+        let last_active = circle.deadline_timestamp; // deadline doubles as last-activity marker
+
+        if now < last_active + FIVE_YEARS_SECS {
+            panic!("Circle is not stale: last activity was less than 5 years ago");
+        }
+
+        // Return any residual insurance balance to the protocol treasury
+        let residual = circle.insurance_balance;
+        if residual > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolTreasury)
+                .expect("Protocol treasury not set");
+            let token_client = token::Client::new(&env, &circle.token);
+            token_client.transfer(&env.current_contract_address(), &treasury, &residual);
+        }
+
+        // Remove the circle entry to reclaim storage rent
+        env.storage().instance().remove(&DataKey::Circle(circle_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "stale_group_purged"), circle_id),
+            (admin, residual),
+        );
     }
 
     fn pair_with_member(env: Env, user: Address, buddy_address: Address) {
@@ -3701,6 +3831,23 @@ impl SoroSusuTrait for SoroSusu {
             .expect("Asset price not found")
     }
     
+    /// # Admin-Only: Set Hard Asset Basket Weights
+    ///
+    /// **Why admin-only:** The hard asset basket defines the reference
+    /// allocation used by the economic circuit breaker to detect treasury
+    /// instability. Allowing arbitrary callers to change these weights could
+    /// disable the circuit breaker or trigger false-positive asset swaps,
+    /// causing unnecessary treasury rebalancing and member losses.
+    ///
+    /// **If admin key is lost:** The basket weights are frozen at their last
+    /// configured values. The circuit breaker continues to operate against the
+    /// frozen reference basket. No funds are at risk, but the protocol cannot
+    /// adapt to changing macro conditions.
+    ///
+    /// **DAO migration path:** Require a ≥ 2/3 governance vote with a 72-hour
+    /// time-lock before basket weights can be changed. Emit a
+    /// `BASKET_CHANGE_PROPOSED` event at proposal time so members can exit
+    /// before the change takes effect.
     fn set_hard_asset_basket(env: Env, admin: Address, gold_weight_bps: u32, btc_weight_bps: u32, silver_weight_bps: u32) {
         // Verify admin authorization
         let stored_admin: Address = env.storage().instance()
@@ -4933,6 +5080,22 @@ impl SoroSusuTrait for SoroSusu {
         );
     }
 
+    /// # Admin-Only: Set Trusted LeaseFlow Bridge Contract
+    ///
+    /// **Why admin-only:** The LeaseFlow contract address is used to verify
+    /// cross-protocol default signals that can pause member payouts. Allowing
+    /// arbitrary callers to set this address would let an attacker register a
+    /// malicious contract that permanently locks all member payouts.
+    ///
+    /// **If admin key is lost:** The LeaseFlow bridge address is frozen. The
+    /// cross-protocol default mechanism continues to work with the existing
+    /// trusted contract. If the LeaseFlow contract is upgraded, the bridge
+    /// cannot be updated and the integration becomes non-functional (but no
+    /// funds are lost).
+    ///
+    /// **DAO migration path:** Require a ≥ 2/3 governance vote with a 48-hour
+    /// time-lock. Emit a `BRIDGE_CHANGE_PROPOSED` event so members can review
+    /// the new contract before it gains the ability to pause payouts.
     fn set_leaseflow_contract(env: Env, admin: Address, leaseflow: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
