@@ -37,6 +37,8 @@ pub enum DataKey {
     BatchHarvestProgress(u64),
     // New: Tracks defaulted members (CircleID, MemberAddress)
     DefaultedMember(u64, Address),
+    // New: Tracks user's circle membership
+    UserCircle(Address),
     // Pause / emergency council
     IsPaused,
     EmergencyCouncil,
@@ -103,6 +105,15 @@ pub struct Member {
     pub missed_deadline_timestamp: u64, // Tracks when member missed deadline (0 if never missed)
     pub opt_out_of_yield: bool,         // Issue #304: member opted out of yield routing
     pub amount_contributed: u64,        // Tracks amount paid for current cycle
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserSummary {
+    pub next_payment_amount: u64, // Amount due for next contribution
+    pub due_date: u64,            // Timestamp when payment is due
+    pub current_position: u32,    // User's position in the circle (contribution count)
+    pub ri_score: u32,            // Reliability Index score (0-10000 basis points)
 }
 
 #[contracttype]
@@ -286,6 +297,11 @@ pub trait SoroSusuTrait {
     /// Opt a member out of yield routing for a circle.
     fn opt_out_of_yield(env: Env, user: Address, circle_id: u64) -> Result<(), u32>;
 
+    // --- Simplified-View Read-Only Wrapper ---
+
+    /// Get aggregated user summary for mobile clients (read-only).
+    fn get_user_summary(env: Env, user: Address) -> Option<UserSummary>;
+
     // --- Commit-reveal voting ---
 
     fn initialize_voting_session(
@@ -440,6 +456,7 @@ impl SoroSusuTrait for SoroSusu {
 
         // 6. Store the member and update circle count
         env.storage().instance().set(&member_key, &new_member);
+        env.storage().instance().set(&DataKey::UserCircle(user.clone()), &circle_id);
         circle.member_count += 1;
 
         // 7. Save the updated circle back to storage
@@ -1474,6 +1491,40 @@ impl SoroSusuTrait for SoroSusu {
             &user,
             &(amount as i128),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Simplified-View Read-Only Wrapper
+    // -----------------------------------------------------------------------
+
+    fn get_user_summary(env: Env, user: Address) -> Option<UserSummary> {
+        // Get user's circle
+        let circle_id: u64 = env.storage().instance().get(&DataKey::UserCircle(user.clone()))?;
+        
+        // Get member data
+        let member: Member = env.storage().instance().get(&DataKey::Member(user.clone()))?;
+        
+        // Get circle data
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))?;
+        
+        // Calculate next payment amount (base contribution, no late fee for summary)
+        let next_payment_amount = circle.contribution_amount;
+        
+        // Calculate due date (next cycle deadline)
+        let due_date = circle.deadline_timestamp + ((member.contribution_count as u64 + 1) * circle.cycle_duration);
+        
+        // Current position (contribution count as position indicator)
+        let current_position = member.contribution_count;
+        
+        // RI score (simplified calculation: contribution_count * 100, capped at 10000)
+        let ri_score = (member.contribution_count as u32 * 100).min(10000);
+        
+        Some(UserSummary {
+            next_payment_amount,
+            due_date,
+            current_position,
+            ri_score,
+        })
     }
 }
 
